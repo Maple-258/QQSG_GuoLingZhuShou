@@ -12,10 +12,9 @@
 
 ## 使用
 
-1. 安装 64 位 Python 3.11。
-2. 双击 [安装国令助手依赖.cmd](scripts/安装国令助手依赖.cmd)。
-3. 双击 [启动国令助手.cmd](scripts/启动国令助手.cmd)。
-4. 选择游戏窗口，截取窗口后点击“识别并复制”。
+1. 前往 [Releases](https://github.com/Maple-258/QQSG_GuoLingZhuShou/releases/latest) 下载最新的 `GuoLingZhuShou-*.exe`。
+2. 双击 EXE 启动国令助手。
+3. 选择游戏窗口，截取窗口后点击“识别并复制”。
 
 首次 OCR 需要网络连接以下载中文模型。
 
