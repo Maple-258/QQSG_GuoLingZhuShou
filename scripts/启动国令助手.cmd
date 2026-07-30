@@ -7,11 +7,11 @@ set "PYTHONW=%PROJECT_DIR%\.venv\Scripts\pythonw.exe"
 
 if not exist "%PYTHONW%" goto :missing_venv
 
-start "Guoling Task OCR" /D "%PROJECT_DIR%" "%PYTHONW%" -m guoling_task_ocr
+start "GuoLingZhuShou" /D "%PROJECT_DIR%" "%PYTHONW%" -m guoling_task_ocr
 exit /b 0
 
 :missing_venv
 echo ERROR: Virtual environment was not found.
-echo Run scripts\安装OCR依赖.cmd first.
+echo Run scripts\安装国令助手依赖.cmd first.
 pause
 exit /b 1

@@ -1,4 +1,4 @@
-"""国令慕贤任务 OCR：识别任务区域中的物品名并复制到剪贴板。"""
+"""国令助手：识别任务区域中的物品名并复制到剪贴板。"""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def capture_game_window(hwnd: int, rect: tuple[int, int, int, int]) -> Image.Ima
         win32gui.ReleaseDC(hwnd, window_dc_handle)
         return image
     except ModuleNotFoundError as error:
-        raise RuntimeError("缺少 pywin32；请重新运行“安装OCR依赖.cmd”") from error
+        raise RuntimeError("缺少 pywin32；请重新运行“安装国令助手依赖.cmd”") from error
 
 
 def capture_game_window_wgc(
@@ -475,7 +475,7 @@ class HotkeyRecorder(tk.Toplevel):
 class GuolingTaskOcr(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("国令慕贤任务识别")
+        self.title("国令助手")
         self.geometry("1140x790")
         self.minsize(960, 620)
         self.configure(bg="#edf1f5")
@@ -517,7 +517,7 @@ class GuolingTaskOcr(tk.Tk):
     def _build_legacy(self) -> None:
         root = ttk.Frame(self, padding=18)
         root.pack(fill="both", expand=True)
-        ttk.Label(root, text="国令慕贤任务识别", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(root, text="国令助手", style="Title.TLabel").pack(anchor="w")
         ttk.Label(root, text="完整截取指定游戏窗口后，以“任务追踪 / 国令慕贤”等文字定位任务区域并识别物品。", style="Note.TLabel").pack(anchor="w", pady=(2, 12))
 
         actions = ttk.Frame(root)
@@ -731,7 +731,7 @@ class GuolingTaskOcr(tk.Tk):
 
             self.hotkey_id = keyboard.add_hotkey(DEFAULT_HOTKEY, self._on_hotkey, suppress=False)
         except ModuleNotFoundError:
-            self.status_var.set("未安装 keyboard 依赖；请运行“安装OCR依赖.cmd”后重启。")
+            self.status_var.set("未安装 keyboard 依赖；请运行“安装国令助手依赖.cmd”后重启。")
         except Exception as error:
             self.status_var.set(f"全局热键注册失败：{error}。可使用界面按钮进行识别。")
 
@@ -769,7 +769,7 @@ class GuolingTaskOcr(tk.Tk):
 
             new_hotkey_id = keyboard.add_hotkey(hotkey, self._on_hotkey, suppress=False)
         except ModuleNotFoundError:
-            self.status_var.set("未安装 keyboard 依赖；请运行“安装OCR依赖.cmd”后重启。")
+            self.status_var.set("未安装 keyboard 依赖；请运行“安装国令助手依赖.cmd”后重启。")
             return False
         except Exception as error:
             self.status_var.set(f"快捷键“{hotkey}”注册失败：{error}")
@@ -1053,7 +1053,7 @@ class GuolingTaskOcr(tk.Tk):
                 ),
             )
         except ModuleNotFoundError:
-            self.after(0, lambda: self._show_error("缺少 OCR 依赖。请先双击“安装OCR依赖.cmd”，完成后重新启动程序。"))
+            self.after(0, lambda: self._show_error("缺少 OCR 依赖。请先双击“安装国令助手依赖.cmd”，完成后重新启动程序。"))
         except Exception as error:
             logging.exception("OCR engine failed")
             # Python clears an exception variable after an ``except`` block. Keep
@@ -1179,14 +1179,14 @@ class GuolingTaskOcr(tk.Tk):
 def report_unhandled_exception(exc_type: type[BaseException], value: BaseException, trace: object) -> None:
     logging.error("Uncaught application exception:\n%s", "".join(traceback.format_exception(exc_type, value, trace)))
     try:
-        messagebox.showerror("国令任务识别启动失败", f"发生错误：{value}\n\n详细日志：{LOG_PATH}")
+        messagebox.showerror("国令助手启动失败", f"发生错误：{value}\n\n详细日志：{LOG_PATH}")
     except Exception:
         pass
 
 
 def main() -> None:
     sys.excepthook = report_unhandled_exception
-    logging.info("Starting Guoling task OCR GUI")
+    logging.info("Starting GuoLingZhuShou GUI")
     app = GuolingTaskOcr()
     app.report_callback_exception = report_unhandled_exception
     app.mainloop()

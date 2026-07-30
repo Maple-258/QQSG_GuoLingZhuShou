@@ -16,7 +16,7 @@ echo.
 if not "%RESULT%"=="0" (
   echo Installation failed. See install_ocr.log in the project root.
 ) else (
-  echo Installation completed. Run scripts\启动国令任务识别.cmd next.
+  echo Installation completed. Run scripts\启动国令助手.cmd next.
 )
 echo.
 pause
