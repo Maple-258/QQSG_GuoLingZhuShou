@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import json
+import os
 import threading
 import tkinter as tk
 import logging
@@ -41,7 +42,24 @@ if not DATA_DIR.is_dir():
     # Allows development runs from the pre-package layout during migration.
     DATA_DIR = PACKAGE_DIR
 RUNTIME_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else PACKAGE_DIR.parents[1]
-LOG_PATH = RUNTIME_DIR / "ocr_app.log"
+
+
+def _persistent_data_dir() -> Path:
+    """Return a writable location that survives one-file EXE extraction."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base_dir = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    app_data_dir = base_dir / "GuoLingZhuShou"
+    try:
+        app_data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return RUNTIME_DIR
+    return app_data_dir
+
+
+APP_DATA_DIR = _persistent_data_dir()
+SETTINGS_PATH = APP_DATA_DIR / "settings.json"
+OCR_MODEL_DIR = APP_DATA_DIR / "ocr_models"
+LOG_PATH = APP_DATA_DIR / "ocr_app.log"
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 TASK_CROP = (0.80, 0.41, 0.985, 0.54)
@@ -49,12 +67,14 @@ DEFAULT_HOTKEY = "ctrl+alt+g"
 DEFAULT_AUTO_INTERVAL_SECONDS = 2.0
 MIN_AUTO_INTERVAL_SECONDS = 0.5
 MAX_AUTO_INTERVAL_SECONDS = 60.0
+CAPTURE_METHODS = ("WGC（后台，高效）", "PrintWindow（兼容）")
 TASK_OCR_SCALE = 4
 UNCHANGED_FRAME_THRESHOLD = 2.0
 WGC_CAPTURE_TIMEOUT_SECONDS = 3.0
 TASK_CONTEXT_TERMS = ("任务", "国令", "NPC", "需要", "收集", "提交", "消灭")
 ITEM_ALIASES_PATH = DATA_DIR / "道具OCR纠错.json"
 ITEM_VOCABULARY_PATH = DATA_DIR / "官方道具词表.json"
+MONSTER_VOCABULARY_PATH = DATA_DIR / "官方怪物词表.json"
 EXCLUDED_WORDS = {
     "任务追踪", "国令慕贤", "高级国令", "当前", "任务", "目标", "进度", "完成",
     "可用", "点击", "道具", "物品", "材料", "需求", "需要", "所需", "收集", "寻找",
@@ -64,6 +84,72 @@ ITEM_PATTERNS = (
     r"(?:需求|需要|所需|物品|道具|材料|收集|寻找|上交|提交|获得)[：: \t]*([\u4e00-\u9fff]{2,8}(?:-\d+级)?)",
     r"([\u4e00-\u9fff]{2,8}(?:-\d+级)?)\s*\d+\s*/\s*\d+",
 )
+
+DEFAULT_SETTINGS: dict[str, str | float] = {
+    "capture_method": CAPTURE_METHODS[1],
+    "interval_seconds": DEFAULT_AUTO_INTERVAL_SECONDS,
+    "hotkey": DEFAULT_HOTKEY,
+    "window_title": "",
+}
+
+
+def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | float]:
+    """Load validated user preferences without letting a bad file prevent startup."""
+    settings = DEFAULT_SETTINGS.copy()
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return settings
+    if not isinstance(payload, dict):
+        return settings
+
+    capture_method = payload.get("capture_method")
+    if capture_method in CAPTURE_METHODS:
+        settings["capture_method"] = capture_method
+
+    try:
+        interval_seconds = float(payload.get("interval_seconds"))
+    except (TypeError, ValueError):
+        interval_seconds = DEFAULT_AUTO_INTERVAL_SECONDS
+    if MIN_AUTO_INTERVAL_SECONDS <= interval_seconds <= MAX_AUTO_INTERVAL_SECONDS:
+        settings["interval_seconds"] = interval_seconds
+
+    hotkey = payload.get("hotkey")
+    if isinstance(hotkey, str) and hotkey.strip():
+        settings["hotkey"] = hotkey.strip()
+
+    window_title = payload.get("window_title")
+    if isinstance(window_title, str):
+        settings["window_title"] = window_title
+    return settings
+
+
+def save_user_settings(settings: dict[str, str | float], settings_path: Path = SETTINGS_PATH) -> None:
+    """Persist only simple preferences; OCR results and screen captures are not stored."""
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        logging.warning("Unable to save settings to %s", settings_path, exc_info=True)
+
+
+def ocr_model_directories(model_root: Path = OCR_MODEL_DIR) -> dict[str, str]:
+    """Keep PaddleOCR models outside PyInstaller's temporary extraction folder."""
+    try:
+        model_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logging.warning("Unable to create OCR model cache at %s", model_root, exc_info=True)
+    return {
+        "det_model_dir": str(model_root / "det"),
+        "rec_model_dir": str(model_root / "rec"),
+        "cls_model_dir": str(model_root / "cls"),
+    }
+
+
+def ensure_writable_error_stream() -> None:
+    """Allow PaddleOCR download progress to run in a windowed EXE without a console."""
+    if sys.stderr is None or not hasattr(sys.stderr, "write"):
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
 def find_qqsg_windows() -> list[tuple[int, str, tuple[int, int, int, int]]]:
@@ -203,6 +289,57 @@ def load_official_item_names() -> frozenset[str]:
         return frozenset()
 
 
+@lru_cache(maxsize=1)
+def load_official_monsters() -> tuple[dict[str, str], ...]:
+    """读取随程序发布的官网怪物资料，用于离线查询。"""
+    try:
+        data = json.loads(MONSTER_VOCABULARY_PATH.read_text(encoding="utf-8-sig"))
+        monsters = data.get("monsters", [])
+        if not isinstance(monsters, list):
+            return ()
+        return tuple(
+            {
+                "name": str(monster.get("name", "")).strip(),
+                "level": str(monster.get("level", "")).strip(),
+                "location": str(monster.get("location", "")).strip(),
+                "drops": str(monster.get("drops", "")).strip(),
+            }
+            for monster in monsters
+            if isinstance(monster, dict) and str(monster.get("name", "")).strip()
+        )
+    except (OSError, ValueError, TypeError):
+        return ()
+
+
+def search_official_monsters(
+    query: str, monsters: tuple[dict[str, str], ...] | None = None
+) -> tuple[dict[str, str], ...]:
+    """按怪物名、等级、地点或掉落物筛选本地怪物词表。"""
+    entries = load_official_monsters() if monsters is None else monsters
+    normalized_query = re.sub(r"\s+", "", query).casefold()
+    if not normalized_query:
+        return entries
+
+    matched = []
+    for monster in entries:
+        normalized_fields = {
+            field: re.sub(r"\s+", "", monster.get(field, "")).casefold()
+            for field in ("name", "level", "location", "drops")
+        }
+        if any(normalized_query in value for value in normalized_fields.values()):
+            matched.append((normalized_fields, monster))
+
+    # Exact monster names should appear first, followed by partial name matches.
+    matched.sort(key=lambda item: (
+        item[0]["name"] != normalized_query,
+        normalized_query not in item[0]["name"],
+        item[1]["name"],
+        item[1]["level"],
+        item[1]["location"],
+    ))
+    return tuple(monster for _fields, monster in matched)
+
+
 def _edit_distance(left: str, right: str) -> int:
     """小词表中使用的字符编辑距离，避免引入额外运行时依赖。"""
     if len(left) < len(right):
@@ -221,15 +358,26 @@ def _edit_distance(left: str, right: str) -> int:
 
 
 def match_official_item_name(candidate: str) -> str:
-    """只接受唯一的近似命中，防止把不相关的菜单文字强行替换。"""
+    """只接受唯一的最接近命中，防止把不相关的文字强行替换。"""
     names = load_official_item_names()
     if candidate in names or len(candidate) < 3:
         return candidate
-    matches = [
-        name for name in names
-        if len(name) == len(candidate) and name[:2] == candidate[:2] and _edit_distance(name, candidate) == 1
-    ]
-    return matches[0] if len(matches) == 1 else candidate
+
+    # A single-character OCR error can occur at the first character as well.
+    # Accept it only when the nearest same-length vocabulary item is unique.
+    closest_distance = 2
+    closest_names: list[str] = []
+    for name in names:
+        if len(name) != len(candidate):
+            continue
+        distance = _edit_distance(name, candidate)
+        if distance < closest_distance:
+            closest_distance = distance
+            closest_names = [name]
+        elif distance == closest_distance:
+            closest_names.append(name)
+
+    return closest_names[0] if closest_distance == 1 and len(closest_names) == 1 else candidate
 
 
 def correct_item_name(candidate: str) -> str:
@@ -472,6 +620,93 @@ class HotkeyRecorder(tk.Toplevel):
         self._cancel_callback()
 
 
+class MonsterLookupDialog(tk.Toplevel):
+    """Offline lookup for the monster records bundled with the application."""
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("怪物词表查询")
+        self.geometry("940x500")
+        self.minsize(720, 360)
+        self.transient(parent)
+        self.query_var = tk.StringVar()
+        self.result_var = tk.StringVar()
+        self._rows: dict[str, dict[str, str]] = {}
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        search_bar = ttk.Frame(body)
+        search_bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        search_bar.columnconfigure(1, weight=1)
+        ttk.Label(search_bar, text="查询", style="Field.TLabel").grid(row=0, column=0, padx=(0, 8))
+        search_entry = ttk.Entry(search_bar, textvariable=self.query_var, style="Result.TEntry")
+        search_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(search_bar, text="清除", command=self._clear).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(search_bar, text="复制名称", command=self._copy_selected, style="Primary.TButton").grid(
+            row=0, column=3, padx=(8, 0)
+        )
+
+        table_holder = ttk.Frame(body)
+        table_holder.grid(row=1, column=0, sticky="nsew")
+        table_holder.columnconfigure(0, weight=1)
+        table_holder.rowconfigure(0, weight=1)
+        columns = ("name", "level", "location", "drops")
+        self.table = ttk.Treeview(table_holder, columns=columns, show="headings", selectmode="browse")
+        self.table.heading("name", text="怪物名称")
+        self.table.heading("level", text="等级")
+        self.table.heading("location", text="出没地点")
+        self.table.heading("drops", text="掉落物品")
+        self.table.column("name", width=170, minwidth=120, anchor="w", stretch=False)
+        self.table.column("level", width=70, minwidth=55, anchor="center", stretch=False)
+        self.table.column("location", width=180, minwidth=130, anchor="w", stretch=False)
+        self.table.column("drops", width=470, minwidth=180, anchor="w")
+        self.table.grid(row=0, column=0, sticky="nsew")
+        vertical_scroll = ttk.Scrollbar(table_holder, orient="vertical", command=self.table.yview)
+        vertical_scroll.grid(row=0, column=1, sticky="ns")
+        horizontal_scroll = ttk.Scrollbar(table_holder, orient="horizontal", command=self.table.xview)
+        horizontal_scroll.grid(row=1, column=0, sticky="ew")
+        self.table.configure(yscrollcommand=vertical_scroll.set, xscrollcommand=horizontal_scroll.set)
+
+        ttk.Label(body, textvariable=self.result_var, style="Note.TLabel").grid(row=2, column=0, sticky="w", pady=(9, 0))
+        self.query_var.trace_add("write", self._refresh)
+        self.table.bind("<Double-1>", lambda _event: self._copy_selected())
+        self._refresh()
+        self.after(100, search_entry.focus_set)
+
+    def _refresh(self, *_args: object) -> None:
+        for item_id in self.table.get_children():
+            self.table.delete(item_id)
+        self._rows.clear()
+        matches = search_official_monsters(self.query_var.get())
+        for index, monster in enumerate(matches):
+            item_id = str(index)
+            self._rows[item_id] = monster
+            self.table.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(monster["name"], monster["level"], monster["location"], monster["drops"] or "-"),
+            )
+        self.result_var.set(f"找到 {len(matches)} 条怪物资料。可按怪物名、等级、地点或掉落物筛选。")
+
+    def _clear(self) -> None:
+        self.query_var.set("")
+
+    def _copy_selected(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择一条怪物资料。", parent=self)
+            return
+        monster = self._rows[selected[0]]
+        self.clipboard_clear()
+        self.clipboard_append(monster["name"])
+        self.update()
+        self.result_var.set(f"已复制“{monster['name']}”。")
+
+
 class GuolingTaskOcr(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -491,12 +726,14 @@ class GuolingTaskOcr(tk.Tk):
         self.ocr_engine = None
         self.ocr_in_progress = False
         self.hotkey_id = None
+        settings = load_user_settings()
         self.auto_var = tk.BooleanVar(value=False)
-        self.interval_var = tk.StringVar(value=f"{DEFAULT_AUTO_INTERVAL_SECONDS:g}")
-        self.hotkey_var = tk.StringVar(value=DEFAULT_HOTKEY)
+        self.interval_var = tk.StringVar(value=f"{float(settings['interval_seconds']):g}")
+        self.hotkey_var = tk.StringVar(value=str(settings["hotkey"]))
         self._auto_generation = 0
         self.window_var = tk.StringVar()
-        self.capture_method_var = tk.StringVar(value="PrintWindow（兼容）")
+        self.capture_method_var = tk.StringVar(value=str(settings["capture_method"]))
+        self.preferred_window_title = str(settings["window_title"])
         self.game_windows: dict[str, tuple[int, tuple[int, int, int, int]]] = {}
         self._style()
         self._build()
@@ -639,7 +876,10 @@ class GuolingTaskOcr(tk.Tk):
             width=17,
         )
         self.capture_method_combo.grid(row=0, column=4, sticky="w")
+        self.capture_method_combo.bind("<<ComboboxSelected>>", self._save_settings)
+        self.window_combo.bind("<<ComboboxSelected>>", self._save_settings)
         ttk.Button(source, text="截取窗口", command=self.capture_selected_window, style="Primary.TButton").grid(row=0, column=5, padx=(12, 0))
+        ttk.Button(source, text="怪物词表", command=self.open_monster_lookup).grid(row=0, column=6, padx=(8, 0))
 
         tools = ttk.Frame(root, style="Surface.TFrame", padding=(14, 9))
         tools.grid(row=2, column=0, sticky="ew", pady=(0, 12))
@@ -739,6 +979,7 @@ class GuolingTaskOcr(tk.Tk):
         self.after(0, self.quick_capture_and_recognize)
 
     def _close(self) -> None:
+        self._save_settings()
         if self.hotkey_id is not None:
             try:
                 import keyboard
@@ -749,7 +990,38 @@ class GuolingTaskOcr(tk.Tk):
         self.destroy()
 
     def _register_hotkey(self) -> None:
+        if self._apply_hotkey(self.hotkey_var.get(), announce=False):
+            return
+        self.hotkey_var.set(DEFAULT_HOTKEY)
         self._apply_hotkey(DEFAULT_HOTKEY, announce=False)
+
+    def open_monster_lookup(self) -> None:
+        """Open one reusable offline monster lookup window."""
+        try:
+            if self.monster_lookup.winfo_exists():
+                self.monster_lookup.deiconify()
+                self.monster_lookup.lift()
+                self.monster_lookup.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.monster_lookup = MonsterLookupDialog(self)
+
+    @staticmethod
+    def _window_title_from_label(label: str) -> str:
+        return label.partition("  [窗口")[0]
+
+    def _save_settings(self, _event: tk.Event | None = None) -> None:
+        self._auto_interval_ms()
+        selected_window_title = self._window_title_from_label(self.window_var.get())
+        if selected_window_title:
+            self.preferred_window_title = selected_window_title
+        save_user_settings({
+            "capture_method": self.capture_method_var.get(),
+            "interval_seconds": float(self.interval_var.get()),
+            "hotkey": self.hotkey_var.get(),
+            "window_title": self.preferred_window_title,
+        })
 
     def _remove_hotkey(self) -> None:
         if self.hotkey_id is None:
@@ -777,6 +1049,7 @@ class GuolingTaskOcr(tk.Tk):
         self._remove_hotkey()
         self.hotkey_id = new_hotkey_id
         self.hotkey_var.set(hotkey)
+        self._save_settings()
         if announce:
             self.status_var.set(f"快捷键已更新为 {hotkey}。")
         return True
@@ -821,6 +1094,18 @@ class GuolingTaskOcr(tk.Tk):
         self.window_combo.configure(values=values)
         if previous in self.game_windows:
             self.window_var.set(previous)
+        elif self.preferred_window_title:
+            restored = next(
+                (
+                    label for label in values
+                    if self._window_title_from_label(label) == self.preferred_window_title
+                ),
+                None,
+            )
+            if restored:
+                self.window_var.set(restored)
+            elif values:
+                self.window_var.set(values[0])
         elif values:
             self.window_var.set(values[0])
             self.status_var.set(f"已发现 {len(values)} 个 QQ 三国窗口；可直接点击“截图选中窗口”。")
@@ -913,6 +1198,7 @@ class GuolingTaskOcr(tk.Tk):
 
     def _validate_auto_interval(self, _event: tk.Event | None = None) -> None:
         self._auto_interval_ms(show_error=self.auto_var.get())
+        self._save_settings()
 
     def toggle_auto(self) -> None:
         self._auto_generation += 1
@@ -993,7 +1279,7 @@ class GuolingTaskOcr(tk.Tk):
         if cached_region:
             self.status_var.set("正在识别缓存的任务区域……")
         else:
-            self.status_var.set("正在定位任务区域并识别中文文字，首次运行会下载 OCR 模型，请稍候……")
+            self.status_var.set("正在定位任务区域并识别中文文字；首次使用会初始化 OCR 模型，请稍候……")
         threading.Thread(
             target=self._recognize_worker,
             args=(image, locate_from_source, window_handle, cached_region),
@@ -1012,7 +1298,13 @@ class GuolingTaskOcr(tk.Tk):
             import numpy as np
 
             if self.ocr_engine is None:
-                self.ocr_engine = PaddleOCR(lang="ch", use_angle_cls=False, show_log=False)
+                ensure_writable_error_stream()
+                self.ocr_engine = PaddleOCR(
+                    lang="ch",
+                    use_angle_cls=False,
+                    show_log=False,
+                    **ocr_model_directories(),
+                )
             full_window_image = image.copy() if locate_from_source and window_handle is not None else None
             location_note = "手动选择的区域"
             used_cached_region = cached_region is not None
