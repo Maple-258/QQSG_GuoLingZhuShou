@@ -1,0 +1,20 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local logs and user-generated state
+*.log
+
+# Packaging output
+build/
+dist/
+release/
+*.spec
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
