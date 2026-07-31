@@ -12,6 +12,7 @@ from guoling_task_ocr.app import (
     load_user_settings,
     ocr_model_directories,
     save_user_settings,
+    task_ocr_target_size,
 )
 
 
@@ -30,6 +31,11 @@ class PreferencesTests(unittest.TestCase):
                     "interval_seconds": 5.0,
                     "hotkey": "f7",
                     "window_title": "QQ三国测试窗口",
+                    "flash_title_filter": "QQ三国",
+                    "flash_window_title": "QQ三国测试窗口",
+                    "flash_sound_mode": "beep",
+                    "flash_wav_path": "C:\\alert.wav",
+                    "flash_cooldown_seconds": 4.5,
                 },
                 settings_path,
             )
@@ -40,6 +46,11 @@ class PreferencesTests(unittest.TestCase):
                     "interval_seconds": 5.0,
                     "hotkey": "f7",
                     "window_title": "QQ三国测试窗口",
+                    "flash_title_filter": "QQ三国",
+                    "flash_window_title": "QQ三国测试窗口",
+                    "flash_sound_mode": "beep",
+                    "flash_wav_path": "C:\\alert.wav",
+                    "flash_cooldown_seconds": 4.5,
                 },
             )
 
@@ -63,6 +74,12 @@ class PreferencesTests(unittest.TestCase):
             self.assertEqual(Path(directories["det_model_dir"]).parent, cache_root)
             self.assertEqual(Path(directories["rec_model_dir"]).parent, cache_root)
             self.assertEqual(Path(directories["cls_model_dir"]).parent, cache_root)
+
+    def test_task_ocr_scale_keeps_small_crops_clear_and_caps_large_ones(self) -> None:
+        self.assertEqual(task_ocr_target_size((400, 200)), (1600, 800))
+        width, height = task_ocr_target_size((1600, 900))
+        self.assertLessEqual(width * height, 4_010_000)
+        self.assertLess(width, 1600 * 4)
 
 
 if __name__ == "__main__":

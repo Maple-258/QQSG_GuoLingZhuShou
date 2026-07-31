@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 import json
+import math
 import os
 import threading
+import time
 import tkinter as tk
 import logging
 import sys
@@ -17,9 +19,11 @@ import urllib.request
 from ctypes import wintypes
 from functools import lru_cache
 from pathlib import Path
+from queue import Empty, Queue
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
+from .flash_alert import FlashEvent, FlashMonitor, list_visible_windows, matches_event, play_sound
 
 from PIL import Image, ImageEnhance, ImageGrab, ImageOps, ImageTk
 
@@ -77,8 +81,14 @@ DEFAULT_HOTKEY = "ctrl+alt+g"
 DEFAULT_AUTO_INTERVAL_SECONDS = 2.0
 MIN_AUTO_INTERVAL_SECONDS = 0.5
 MAX_AUTO_INTERVAL_SECONDS = 60.0
+DEFAULT_FLASH_COOLDOWN_SECONDS = 3.0
+MIN_FLASH_COOLDOWN_SECONDS = 0.0
+MAX_FLASH_COOLDOWN_SECONDS = 60.0
+FLASH_EVENT_QUEUE_SIZE = 256
+FLASH_EVENTS_PER_TICK = 32
 CAPTURE_METHODS = ("WGC（后台，高效）", "PrintWindow（兼容）")
 TASK_OCR_SCALE = 4
+TASK_OCR_MAX_PIXELS = 4_000_000
 UNCHANGED_FRAME_THRESHOLD = 2.0
 WGC_CAPTURE_TIMEOUT_SECONDS = 3.0
 TASK_CONTEXT_TERMS = ("任务", "国令", "NPC", "需要", "收集", "提交", "消灭")
@@ -101,7 +111,19 @@ DEFAULT_SETTINGS: dict[str, str | float] = {
     "interval_seconds": DEFAULT_AUTO_INTERVAL_SECONDS,
     "hotkey": DEFAULT_HOTKEY,
     "window_title": "",
+    "flash_title_filter": "",
+    "flash_window_title": "",
+    "flash_sound_mode": "system",
+    "flash_wav_path": "",
+    "flash_cooldown_seconds": DEFAULT_FLASH_COOLDOWN_SECONDS,
 }
+
+
+def task_ocr_target_size(image_size: tuple[int, int]) -> tuple[int, int]:
+    """Preserve the normal 4x OCR scale without allowing oversized task crops."""
+    width, height = image_size
+    scale = min(TASK_OCR_SCALE, math.sqrt(TASK_OCR_MAX_PIXELS / (width * height)))
+    return max(1, round(width * scale)), max(1, round(height * scale))
 
 
 def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | float]:
@@ -132,6 +154,22 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
     window_title = payload.get("window_title")
     if isinstance(window_title, str):
         settings["window_title"] = window_title
+
+    for key in ("flash_title_filter", "flash_window_title", "flash_wav_path"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            settings[key] = value
+
+    sound_mode = payload.get("flash_sound_mode")
+    if sound_mode in {"system", "wav", "beep"}:
+        settings["flash_sound_mode"] = sound_mode
+
+    try:
+        flash_cooldown = float(payload.get("flash_cooldown_seconds"))
+    except (TypeError, ValueError):
+        flash_cooldown = DEFAULT_FLASH_COOLDOWN_SECONDS
+    if MIN_FLASH_COOLDOWN_SECONDS <= flash_cooldown <= MAX_FLASH_COOLDOWN_SECONDS:
+        settings["flash_cooldown_seconds"] = flash_cooldown
     return settings
 
 
@@ -1031,12 +1069,256 @@ class AboutDialog(tk.Toplevel):
         webbrowser.open_new_tab(self.release_url)
 
 
+class FlashAlertDialog(tk.Toplevel):
+    """Configure and run an in-process alert for Windows taskbar flash events."""
+
+    SOUND_LABELS = {
+        "系统提示音": "system",
+        "WAV 文件": "wav",
+        "蜂鸣音": "beep",
+    }
+
+    def __init__(self, parent: "GuolingTaskOcr") -> None:
+        super().__init__(parent)
+        self.parent_app = parent
+        self.title("窗口闪烁提醒")
+        self.geometry("960x650")
+        self.minsize(800, 530)
+        self.transient(parent)
+        self.events: Queue[FlashEvent] = Queue(maxsize=FLASH_EVENT_QUEUE_SIZE)
+        self.monitor = FlashMonitor(self.events)
+        self.window_handles: dict[str, int] = {}
+        self.last_alert: dict[int, float] = {}
+        self.reports: list[str] = []
+        self.status_var = tk.StringVar(value="正在启动窗口闪烁监听……")
+        self.sound_label_var = tk.StringVar(value=self._sound_label(parent.flash_sound_mode_var.get()))
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1)
+        ttk.Label(body, text="窗口闪烁提醒", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            body,
+            text="当目标窗口在任务栏闪烁时播放声音。可按窗口标题或指定窗口筛选。",
+            style="Note.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
+
+        target_settings = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        target_settings.grid(row=2, column=0, sticky="ew")
+        target_settings.columnconfigure(1, weight=1)
+        ttk.Label(target_settings, text="监听目标", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 9))
+        ttk.Label(target_settings, text="标题关键字", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        filter_entry = ttk.Entry(target_settings, textvariable=parent.flash_title_filter_var)
+        filter_entry.grid(row=1, column=1, sticky="ew")
+        filter_entry.bind("<FocusOut>", self._save_preferences)
+        ttk.Label(target_settings, text="指定窗口", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(9, 0), padx=(0, 10))
+        self.window_combo = ttk.Combobox(
+            target_settings, textvariable=parent.flash_window_var, state="readonly"
+        )
+        self.window_combo.grid(row=2, column=1, sticky="ew", pady=(9, 0))
+        self.window_combo.bind("<<ComboboxSelected>>", self._save_preferences)
+        target_actions = ttk.Frame(target_settings, style="Toolbar.TFrame")
+        target_actions.grid(row=3, column=1, sticky="e", pady=(9, 0))
+        ttk.Button(target_actions, text="刷新窗口列表", command=self.refresh_windows).pack(side="left")
+        ttk.Button(target_actions, text="使用当前游戏窗口", command=self.use_current_game_window).pack(side="left", padx=(7, 0))
+
+        alert_settings = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        alert_settings.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        alert_settings.columnconfigure(1, weight=1)
+        ttk.Label(alert_settings, text="提醒方式", style="Section.TLabel").grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 9))
+        ttk.Label(alert_settings, text="提醒声音", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        sound_combo = ttk.Combobox(
+            alert_settings, textvariable=self.sound_label_var, values=tuple(self.SOUND_LABELS), state="readonly", width=14
+        )
+        sound_combo.grid(row=1, column=1, sticky="w")
+        sound_combo.bind("<<ComboboxSelected>>", self._sound_changed)
+        ttk.Label(alert_settings, text="冷却时间", style="Field.TLabel").grid(row=1, column=2, sticky="e", padx=(18, 5))
+        cooldown = ttk.Spinbox(
+            alert_settings,
+            from_=MIN_FLASH_COOLDOWN_SECONDS,
+            to=MAX_FLASH_COOLDOWN_SECONDS,
+            increment=0.5,
+            textvariable=parent.flash_cooldown_var,
+            width=5,
+            justify="center",
+        )
+        cooldown.grid(row=1, column=3, sticky="w")
+        cooldown.bind("<FocusOut>", self._save_preferences)
+        cooldown.bind("<Return>", self._save_preferences)
+        ttk.Label(alert_settings, text="秒", style="Field.TLabel").grid(row=1, column=4, sticky="w", padx=(5, 0))
+
+        ttk.Label(alert_settings, text="WAV 路径", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(9, 0), padx=(0, 10))
+        wav_entry = ttk.Entry(alert_settings, textvariable=parent.flash_wav_path_var)
+        wav_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(9, 0))
+        wav_entry.bind("<FocusOut>", self._save_preferences)
+        ttk.Button(alert_settings, text="选择 WAV 文件", command=self.choose_wav).grid(row=2, column=4, padx=(8, 0), pady=(9, 0))
+
+        report_holder = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        report_holder.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        report_holder.rowconfigure(1, weight=1)
+        report_holder.columnconfigure(0, weight=1)
+        ttk.Label(report_holder, text="检测报告", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(report_holder, text="清空", command=self.clear_reports).grid(row=0, column=1, sticky="e")
+        self.report_text = tk.Text(
+            report_holder,
+            height=9,
+            wrap="word",
+            relief="solid",
+            borderwidth=1,
+            background="#f8fafc",
+            foreground="#27364a",
+            font=("Microsoft YaHei UI", 9),
+            state="disabled",
+            padx=8,
+            pady=7,
+        )
+        self.report_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(7, 0))
+
+        footer = ttk.Frame(body)
+        footer.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(3, weight=1)
+        self.start_button = ttk.Button(footer, text="开始监听", command=self.start_monitor, style="Primary.TButton")
+        self.start_button.grid(row=0, column=0)
+        self.stop_button = ttk.Button(footer, text="停止监听", command=self.stop_monitor)
+        self.stop_button.grid(row=0, column=1, padx=(7, 0))
+        ttk.Button(footer, text="测试声音", command=self.test_sound).grid(row=0, column=2, padx=(7, 0))
+        ttk.Label(footer, textvariable=self.status_var, style="Note.TLabel").grid(row=0, column=3, sticky="w", padx=(12, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh_windows()
+        self.start_monitor()
+        self.after(100, self.process_events)
+
+    @classmethod
+    def _sound_label(cls, mode: str) -> str:
+        return next((label for label, value in cls.SOUND_LABELS.items() if value == mode), "系统提示音")
+
+    def _add_report(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.reports.append(f"{timestamp}  {message}")
+        self.reports = self.reports[-100:]
+        self.report_text.configure(state="normal")
+        self.report_text.delete("1.0", "end")
+        self.report_text.insert("1.0", "\n".join(self.reports))
+        self.report_text.see("end")
+        self.report_text.configure(state="disabled")
+
+    def clear_reports(self) -> None:
+        self.reports.clear()
+        self._add_report("已清空检测报告")
+
+    def refresh_windows(self) -> None:
+        previous_title = self.parent_app._window_title_from_label(self.parent_app.flash_window_var.get())
+        self.window_handles.clear()
+        for hwnd, title in list_visible_windows():
+            label = f"{title}  [窗口 {hwnd}]"
+            self.window_handles[label] = hwnd
+        values = tuple(self.window_handles)
+        self.window_combo.configure(values=values)
+        restored = next((label for label in values if self.parent_app._window_title_from_label(label) == previous_title), "")
+        self.parent_app.flash_window_var.set(restored)
+        self._add_report(f"刷新窗口列表：找到 {len(values)} 个可见窗口")
+
+    def use_current_game_window(self) -> None:
+        selection = self.parent_app.game_windows.get(self.parent_app.window_var.get())
+        if not selection:
+            messagebox.showinfo("提示", "请先在主界面选择 QQ 三国窗口。", parent=self)
+            return
+        hwnd, _rect = selection
+        label = next((candidate for candidate, candidate_hwnd in self.window_handles.items() if candidate_hwnd == hwnd), "")
+        if not label:
+            self.refresh_windows()
+            label = next((candidate for candidate, candidate_hwnd in self.window_handles.items() if candidate_hwnd == hwnd), "")
+        if not label:
+            messagebox.showinfo("提示", "当前游戏窗口不在可监听窗口列表中。", parent=self)
+            return
+        self.parent_app.flash_window_var.set(label)
+        self._save_preferences()
+        self._add_report("已将当前 QQ 三国窗口设为提醒目标")
+
+    def _sound_changed(self, _event: tk.Event | None = None) -> None:
+        self.parent_app.flash_sound_mode_var.set(self.SOUND_LABELS[self.sound_label_var.get()])
+        self._save_preferences()
+
+    def _save_preferences(self, _event: tk.Event | None = None) -> None:
+        self.parent_app._save_settings()
+
+    def choose_wav(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="选择提醒 WAV 文件",
+            filetypes=(("WAV 音频", "*.wav"), ("所有文件", "*.*")),
+        )
+        if path:
+            self.parent_app.flash_wav_path_var.set(path)
+            self._save_preferences()
+
+    def _cooldown_seconds(self) -> float:
+        try:
+            value = float(self.parent_app.flash_cooldown_var.get())
+        except (TypeError, ValueError):
+            value = DEFAULT_FLASH_COOLDOWN_SECONDS
+        value = min(MAX_FLASH_COOLDOWN_SECONDS, max(MIN_FLASH_COOLDOWN_SECONDS, value))
+        self.parent_app.flash_cooldown_var.set(f"{value:g}")
+        return value
+
+    def start_monitor(self) -> None:
+        try:
+            self.monitor.start()
+        except RuntimeError as error:
+            self.status_var.set(f"监听启动失败：{error}")
+            self._add_report(f"监听启动失败：{error}")
+            return
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.status_var.set("监听中")
+        self._add_report("开始监听窗口闪烁事件")
+
+    def stop_monitor(self) -> None:
+        self.monitor.stop()
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.status_var.set("已停止监听")
+        self._add_report("停止监听")
+
+    def test_sound(self) -> None:
+        success = play_sound(self.parent_app.flash_sound_mode_var.get(), self.parent_app.flash_wav_path_var.get())
+        self.status_var.set("已播放测试声音" if success else "测试声音播放失败")
+        self._add_report("测试声音播放成功" if success else "测试声音播放失败")
+
+    def process_events(self) -> None:
+        for _ in range(FLASH_EVENTS_PER_TICK):
+            try:
+                event = self.events.get_nowait()
+            except Empty:
+                break
+            selected_hwnd = self.window_handles.get(self.parent_app.flash_window_var.get())
+            if not matches_event(event, self.parent_app.flash_title_filter_var.get(), selected_hwnd):
+                continue
+            now = time.monotonic()
+            last = self.last_alert.get(event.hwnd)
+            if last is not None and now - last < self._cooldown_seconds():
+                continue
+            self.last_alert[event.hwnd] = now
+            success = play_sound(self.parent_app.flash_sound_mode_var.get(), self.parent_app.flash_wav_path_var.get())
+            self.status_var.set(f"{'已提醒' if success else '声音播放失败'}：{event.title}")
+            self._add_report(f"{'已提醒' if success else '声音播放失败'}：{event.source}，{event.title}")
+        if self.winfo_exists():
+            self.after(100, self.process_events)
+
+    def close(self) -> None:
+        self.monitor.stop()
+        self.parent_app._save_settings()
+        self.destroy()
+
+
 class GuolingTaskOcr(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("国令助手")
-        self.geometry("1240x820")
-        self.minsize(1020, 650)
+        self.geometry("1240x860")
+        self.minsize(1020, 690)
         self.configure(bg="#edf1f5")
         self.source_image: Image.Image | None = None
         self.crop_image: Image.Image | None = None
@@ -1054,6 +1336,11 @@ class GuolingTaskOcr(tk.Tk):
         self.auto_var = tk.BooleanVar(value=False)
         self.interval_var = tk.StringVar(value=f"{float(settings['interval_seconds']):g}")
         self.hotkey_var = tk.StringVar(value=str(settings["hotkey"]))
+        self.flash_title_filter_var = tk.StringVar(value=str(settings["flash_title_filter"]))
+        self.flash_window_var = tk.StringVar(value=str(settings["flash_window_title"]))
+        self.flash_sound_mode_var = tk.StringVar(value=str(settings["flash_sound_mode"]))
+        self.flash_wav_path_var = tk.StringVar(value=str(settings["flash_wav_path"]))
+        self.flash_cooldown_var = tk.StringVar(value=f"{float(settings['flash_cooldown_seconds']):g}")
         self._auto_generation = 0
         self.window_var = tk.StringVar()
         self.capture_method_var = tk.StringVar(value=str(settings["capture_method"]))
@@ -1206,14 +1493,20 @@ class GuolingTaskOcr(tk.Tk):
 
         tools = ttk.Frame(root, style="Surface.TFrame", padding=(14, 9))
         tools.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        tools.columnconfigure(7, weight=1)
-        ttk.Button(tools, text="框选屏幕", command=self.capture_and_select).grid(row=0, column=0, sticky="w")
-        ttk.Button(tools, text="载入截图", command=self.load_image).grid(row=0, column=1, padx=(7, 0))
-        ttk.Button(tools, text="默认区域", command=self.default_crop).grid(row=0, column=2, padx=(7, 14))
-        ttk.Checkbutton(tools, text="实时识别", variable=self.auto_var, command=self.toggle_auto).grid(row=0, column=3, sticky="w")
-        ttk.Label(tools, text="间隔", style="Field.TLabel").grid(row=0, column=4, padx=(12, 5))
+        tools.columnconfigure(1, weight=1)
+
+        capture_tools = ttk.Frame(tools, style="Toolbar.TFrame")
+        capture_tools.grid(row=0, column=0, sticky="w")
+        ttk.Button(capture_tools, text="框选屏幕", command=self.capture_and_select).pack(side="left")
+        ttk.Button(capture_tools, text="载入截图", command=self.load_image).pack(side="left", padx=(7, 0))
+        ttk.Button(capture_tools, text="默认区域", command=self.default_crop).pack(side="left", padx=(7, 0))
+
+        auto_tools = ttk.Frame(tools, style="Toolbar.TFrame")
+        auto_tools.grid(row=0, column=1, sticky="e")
+        ttk.Checkbutton(auto_tools, text="实时识别", variable=self.auto_var, command=self.toggle_auto).pack(side="left")
+        ttk.Label(auto_tools, text="间隔", style="Field.TLabel").pack(side="left", padx=(12, 5))
         self.interval_spinbox = ttk.Spinbox(
-            tools,
+            auto_tools,
             from_=MIN_AUTO_INTERVAL_SECONDS,
             to=MAX_AUTO_INTERVAL_SECONDS,
             increment=0.5,
@@ -1221,19 +1514,28 @@ class GuolingTaskOcr(tk.Tk):
             width=5,
             justify="center",
         )
-        self.interval_spinbox.grid(row=0, column=5)
+        self.interval_spinbox.pack(side="left")
         self.interval_spinbox.bind("<FocusOut>", self._validate_auto_interval)
         self.interval_spinbox.bind("<Return>", self._validate_auto_interval)
-        ttk.Label(tools, text="秒", style="Field.TLabel").grid(row=0, column=6, padx=(5, 14))
-        ttk.Label(tools, text="快捷键", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(tools, textvariable=self.hotkey_var, style="Field.TLabel", width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Button(tools, text="录制", command=self.record_hotkey).grid(row=1, column=2, padx=(6, 0), pady=(8, 0))
-        ttk.Button(tools, text="怪物词表", command=self.open_monster_lookup).grid(row=1, column=3, padx=(12, 0), pady=(8, 0))
-        ttk.Button(tools, text="自定义词库", command=self.open_custom_vocabulary).grid(row=1, column=4, padx=(7, 0), pady=(8, 0))
-        ttk.Button(tools, text="关于 / 更新", command=self.open_about_dialog).grid(row=1, column=5, padx=(7, 0), pady=(8, 0))
-        ttk.Button(tools, text="快捷识别", command=self.quick_capture_and_recognize, style="Quick.TButton").grid(row=1, column=8, padx=(8, 0), pady=(8, 0))
-        self.recognize_button = ttk.Button(tools, text="识别并复制", command=self.recognize, state="disabled", style="Primary.TButton")
-        self.recognize_button.grid(row=1, column=9, padx=(8, 0), pady=(8, 0))
+        ttk.Label(auto_tools, text="秒", style="Field.TLabel").pack(side="left", padx=(5, 0))
+
+        settings_tools = ttk.Frame(tools, style="Toolbar.TFrame")
+        settings_tools.grid(row=1, column=0, sticky="w", pady=(9, 0))
+        ttk.Label(settings_tools, text="快捷键", style="Field.TLabel").pack(side="left")
+        ttk.Label(settings_tools, textvariable=self.hotkey_var, style="Field.TLabel", width=14).pack(side="left", padx=(8, 0))
+        ttk.Button(settings_tools, text="录制", command=self.record_hotkey).pack(side="left", padx=(6, 0))
+        ttk.Button(settings_tools, text="怪物词表", command=self.open_monster_lookup).pack(side="left", padx=(14, 0))
+        ttk.Button(settings_tools, text="自定义词库", command=self.open_custom_vocabulary).pack(side="left", padx=(7, 0))
+        ttk.Button(settings_tools, text="闪烁提醒", command=self.open_flash_alert).pack(side="left", padx=(7, 0))
+        ttk.Button(settings_tools, text="关于 / 更新", command=self.open_about_dialog).pack(side="left", padx=(7, 0))
+
+        recognition_actions = ttk.Frame(tools, style="Toolbar.TFrame")
+        recognition_actions.grid(row=1, column=1, sticky="e", pady=(9, 0))
+        ttk.Button(recognition_actions, text="快捷识别", command=self.quick_capture_and_recognize, style="Quick.TButton").pack(side="left")
+        self.recognize_button = ttk.Button(
+            recognition_actions, text="识别并复制", command=self.recognize, state="disabled", style="Primary.TButton"
+        )
+        self.recognize_button.pack(side="left", padx=(8, 0))
 
         content = ttk.Frame(root)
         content.grid(row=3, column=0, sticky="nsew")
@@ -1306,6 +1608,11 @@ class GuolingTaskOcr(tk.Tk):
 
     def _close(self) -> None:
         self._save_settings()
+        try:
+            if self.flash_alert.winfo_exists():
+                self.flash_alert.close()
+        except AttributeError:
+            pass
         if self.hotkey_id is not None:
             try:
                 import keyboard
@@ -1357,6 +1664,18 @@ class GuolingTaskOcr(tk.Tk):
             pass
         self.about_dialog = AboutDialog(self)
 
+    def open_flash_alert(self) -> None:
+        """Open the integrated Windows taskbar-flash sound reminder."""
+        try:
+            if self.flash_alert.winfo_exists():
+                self.flash_alert.deiconify()
+                self.flash_alert.lift()
+                self.flash_alert.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.flash_alert = FlashAlertDialog(self)
+
     @staticmethod
     def _window_title_from_label(label: str) -> str:
         return label.partition("  [窗口")[0]
@@ -1371,7 +1690,21 @@ class GuolingTaskOcr(tk.Tk):
             "interval_seconds": float(self.interval_var.get()),
             "hotkey": self.hotkey_var.get(),
             "window_title": self.preferred_window_title,
+            "flash_title_filter": self.flash_title_filter_var.get(),
+            "flash_window_title": self._window_title_from_label(self.flash_window_var.get()),
+            "flash_sound_mode": self.flash_sound_mode_var.get(),
+            "flash_wav_path": self.flash_wav_path_var.get(),
+            "flash_cooldown_seconds": self._flash_cooldown_seconds(),
         })
+
+    def _flash_cooldown_seconds(self) -> float:
+        try:
+            value = float(self.flash_cooldown_var.get())
+        except (TypeError, ValueError):
+            value = DEFAULT_FLASH_COOLDOWN_SECONDS
+        value = min(MAX_FLASH_COOLDOWN_SECONDS, max(MIN_FLASH_COOLDOWN_SECONDS, value))
+        self.flash_cooldown_var.set(f"{value:g}")
+        return value
 
     def _remove_hotkey(self) -> None:
         if self.hotkey_id is None:
@@ -1705,17 +2038,13 @@ class GuolingTaskOcr(tk.Tk):
 
     def _recognize_task_crop(self, image: Image.Image, numpy_module: object) -> tuple[list[str], Image.Image]:
         """Run the task-area OCR pass, including a higher-contrast retry."""
-        scaled = image.resize(
-            (image.width * TASK_OCR_SCALE, image.height * TASK_OCR_SCALE), Image.Resampling.LANCZOS
-        )
+        scaled = image.resize(task_ocr_target_size(image.size), Image.Resampling.LANCZOS)
         enhanced = ImageEnhance.Sharpness(ImageEnhance.Contrast(ImageOps.grayscale(scaled)).enhance(2.2)).enhance(2.0)
         entries = self._ocr_entries(numpy_module.array(scaled))
         if not entries:
             entries = self._ocr_entries(numpy_module.array(enhanced.convert("RGB")))
         lines = [text for _box, text in entries]
-        final_crop = scaled.resize(
-            (scaled.width // TASK_OCR_SCALE, scaled.height // TASK_OCR_SCALE), Image.Resampling.LANCZOS
-        )
+        final_crop = scaled.resize(image.size, Image.Resampling.LANCZOS)
         return lines, final_crop
 
     @staticmethod
