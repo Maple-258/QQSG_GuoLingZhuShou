@@ -6,6 +6,12 @@ __pycache__/
 
 # Local logs and user-generated state
 *.log
+.env
+.env.*
+!.env.example
+*.tmp
+*.bak
+*.swp
 
 # Packaging output
 build/
