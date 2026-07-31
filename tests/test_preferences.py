@@ -12,6 +12,7 @@ from guoling_task_ocr.app import (
     load_user_settings,
     ocr_model_directories,
     save_user_settings,
+    should_skip_unchanged_task,
     task_ocr_target_size,
 )
 
@@ -82,6 +83,11 @@ class PreferencesTests(unittest.TestCase):
         width, height = task_ocr_target_size((1600, 900))
         self.assertLessEqual(width * height, 4_010_000)
         self.assertLess(width, 1600 * 4)
+
+    def test_only_realtime_mode_skips_an_unchanged_task(self) -> None:
+        signature = b"same-task"
+        self.assertFalse(should_skip_unchanged_task(False, signature, signature))
+        self.assertTrue(should_skip_unchanged_task(True, signature, signature))
 
 
 if __name__ == "__main__":

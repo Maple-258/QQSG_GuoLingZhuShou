@@ -127,6 +127,15 @@ def task_ocr_target_size(image_size: tuple[int, int]) -> tuple[int, int]:
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
+def should_skip_unchanged_task(
+    skip_unchanged: bool, signature: bytes, previous_signature: bytes | None
+) -> bool:
+    if not skip_unchanged or previous_signature is None:
+        return False
+    difference = sum(abs(left - right) for left, right in zip(signature, previous_signature)) / len(signature)
+    return difference < UNCHANGED_FRAME_THRESHOLD
+
+
 def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | float]:
     """Load validated user preferences without letting a bad file prevent startup."""
     settings = DEFAULT_SETTINGS.copy()
@@ -1850,7 +1859,7 @@ class GuolingTaskOcr(tk.Tk):
                 return capture_game_window(hwnd, rect), "PrintWindow（WGC 失败回退）"
         return capture_game_window(hwnd, rect), "PrintWindow"
 
-    def quick_capture_and_recognize(self) -> None:
+    def quick_capture_and_recognize(self, skip_unchanged: bool = False) -> None:
         """热键/实时模式使用的无交互快速识别。"""
         if self.ocr_in_progress:
             return
@@ -1861,34 +1870,23 @@ class GuolingTaskOcr(tk.Tk):
                 selection = self.game_windows.get(self.window_var.get())
             if selection:
                 hwnd, rect = selection
-                self._capture_and_recognize_window(hwnd, rect)
+                self._capture_and_recognize_window(hwnd, rect, skip_unchanged)
             else:
                 self.source_image = ImageGrab.grab(all_screens=True).convert("RGB")
                 self.set_source_for_location(self.source_image)
-                self.recognize()
+                self.recognize(skip_unchanged=skip_unchanged)
         except Exception as error:
             self._show_error(f"快捷截图失败：{error!r}")
 
-    def _capture_and_recognize_window(self, hwnd: int, rect: tuple[int, int, int, int]) -> None:
+    def _capture_and_recognize_window(
+        self, hwnd: int, rect: tuple[int, int, int, int], skip_unchanged: bool
+    ) -> None:
         try:
             self.source_image, _capture_note = self._capture_selected_game_window(hwnd, rect)
             self.set_source_for_location(self.source_image, hwnd)
-            self.recognize()
+            self.recognize(skip_unchanged=skip_unchanged)
         except Exception as error:
             self._show_error(f"快捷截图失败：{error!r}")
-
-    def toggle_auto(self) -> None:
-        if self.auto_var.get():
-            self.status_var.set("实时识别已开启：首次定位任务区域，后续仅识别变化的小区域。")
-            self._auto_tick()
-        else:
-            self.status_var.set("实时识别已关闭；仍可使用 Ctrl+Alt+G 快捷识别。")
-
-    def _auto_tick(self) -> None:
-        if not self.auto_var.get():
-            return
-        self.quick_capture_and_recognize()
-        self.after(int(DEFAULT_AUTO_INTERVAL_SECONDS * 1000), self._auto_tick)
 
     def _auto_interval_ms(self, show_error: bool = False) -> int:
         try:
@@ -1922,7 +1920,7 @@ class GuolingTaskOcr(tk.Tk):
     def _auto_tick(self, generation: int) -> None:
         if not self.auto_var.get() or generation != self._auto_generation:
             return
-        self.quick_capture_and_recognize()
+        self.quick_capture_and_recognize(skip_unchanged=True)
         self.after(self._auto_interval_ms(), lambda: self._auto_tick(generation))
 
     def load_image(self) -> None:
@@ -1969,7 +1967,7 @@ class GuolingTaskOcr(tk.Tk):
         self.recognize_button.configure(state="normal")
         self.status_var.set("已完整截取窗口；点击“识别并复制”将自动定位任务追踪区域。")
 
-    def recognize(self) -> None:
+    def recognize(self, skip_unchanged: bool = False) -> None:
         if self.ocr_in_progress:
             return
         if self.locate_from_source and self.source_image:
@@ -1992,7 +1990,7 @@ class GuolingTaskOcr(tk.Tk):
             self.status_var.set("正在定位任务区域并识别中文文字；首次使用会初始化 OCR 模型，请稍候……")
         threading.Thread(
             target=self._recognize_worker,
-            args=(image, locate_from_source, window_handle, cached_region),
+            args=(image, locate_from_source, window_handle, cached_region, skip_unchanged),
             daemon=True,
         ).start()
 
@@ -2002,6 +2000,7 @@ class GuolingTaskOcr(tk.Tk):
         locate_from_source: bool,
         window_handle: int | None,
         cached_region: tuple[float, float, float, float] | None,
+        skip_unchanged: bool,
     ) -> None:
         try:
             from paddleocr import PaddleOCR
@@ -2029,10 +2028,11 @@ class GuolingTaskOcr(tk.Tk):
                 region_for_cache = self._relative_region(crop_box, full_image.size)
 
             signature = self._task_signature(image)
-            if used_cached_region and self.last_task_signature is not None:
-                if self._signature_difference(signature, self.last_task_signature) < UNCHANGED_FRAME_THRESHOLD:
-                    self.after(0, self._show_unchanged_frame)
-                    return
+            if used_cached_region and should_skip_unchanged_task(
+                skip_unchanged, signature, self.last_task_signature
+            ):
+                self.after(0, self._show_unchanged_frame)
+                return
 
             lines, final_crop = self._recognize_task_crop(image, np)
 
