@@ -216,8 +216,10 @@ class FlashMonitor:
                 pass
 
 
-def matches_event(event: FlashEvent, title_filter: str, selected_hwnd: int | None) -> bool:
-    if selected_hwnd is not None and event.hwnd != selected_hwnd:
-        return False
-    keyword = title_filter.strip().casefold()
-    return not keyword or keyword in event.title.casefold()
+def matches_event(
+    event: FlashEvent, title_filter: str, selected_hwnd: int | None, target_mode: str = "window"
+) -> bool:
+    if target_mode == "keyword":
+        keywords = [keyword.strip().casefold() for keyword in title_filter.split("|") if keyword.strip()]
+        return bool(keywords) and any(keyword in event.title.casefold() for keyword in keywords)
+    return selected_hwnd is not None and event.hwnd == selected_hwnd

@@ -112,6 +112,7 @@ DEFAULT_SETTINGS: dict[str, str | float] = {
     "hotkey": DEFAULT_HOTKEY,
     "window_title": "",
     "flash_title_filter": "",
+    "flash_target_mode": "window",
     "flash_window_title": "",
     "flash_sound_mode": "system",
     "flash_wav_path": "",
@@ -169,6 +170,12 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
         value = payload.get(key)
         if isinstance(value, str):
             settings[key] = value
+
+    target_mode = payload.get("flash_target_mode")
+    if target_mode in {"window", "keyword"}:
+        settings["flash_target_mode"] = target_mode
+    elif settings["flash_title_filter"] and not settings["flash_window_title"]:
+        settings["flash_target_mode"] = "keyword"
 
     sound_mode = payload.get("flash_sound_mode")
     if sound_mode in {"system", "wav", "beep"}:
@@ -1111,7 +1118,7 @@ class FlashAlertDialog(tk.Toplevel):
         ttk.Label(body, text="窗口闪烁提醒", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             body,
-            text="当目标窗口在任务栏闪烁时播放声音。可按窗口标题或指定窗口筛选。",
+            text="当目标窗口在任务栏闪烁时播放声音。可选择指定窗口或按自定义标题关键词监控。",
             style="Note.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(4, 12))
 
@@ -1119,18 +1126,27 @@ class FlashAlertDialog(tk.Toplevel):
         target_settings.grid(row=2, column=0, sticky="ew")
         target_settings.columnconfigure(1, weight=1)
         ttk.Label(target_settings, text="监听目标", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 9))
-        ttk.Label(target_settings, text="标题关键字", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
-        filter_entry = ttk.Entry(target_settings, textvariable=parent.flash_title_filter_var)
-        filter_entry.grid(row=1, column=1, sticky="ew")
-        filter_entry.bind("<FocusOut>", self._save_preferences)
-        ttk.Label(target_settings, text="指定窗口", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(9, 0), padx=(0, 10))
+        mode_holder = ttk.Frame(target_settings, style="Toolbar.TFrame")
+        mode_holder.grid(row=1, column=1, sticky="w")
+        ttk.Label(target_settings, text="监控方式", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        ttk.Radiobutton(
+            mode_holder, text="指定窗口", variable=parent.flash_target_mode_var, value="window", command=self._target_mode_changed
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_holder, text="自定义关键词", variable=parent.flash_target_mode_var, value="keyword", command=self._target_mode_changed
+        ).pack(side="left", padx=(12, 0))
+        ttk.Label(target_settings, text="标题关键词", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(9, 0), padx=(0, 10))
+        self.filter_entry = ttk.Entry(target_settings, textvariable=parent.flash_title_filter_var)
+        self.filter_entry.grid(row=2, column=1, sticky="ew", pady=(9, 0))
+        self.filter_entry.bind("<FocusOut>", self._save_preferences)
+        ttk.Label(target_settings, text="指定窗口", style="Field.TLabel").grid(row=3, column=0, sticky="w", pady=(9, 0), padx=(0, 10))
         self.window_combo = ttk.Combobox(
             target_settings, textvariable=parent.flash_window_var, state="readonly"
         )
-        self.window_combo.grid(row=2, column=1, sticky="ew", pady=(9, 0))
+        self.window_combo.grid(row=3, column=1, sticky="ew", pady=(9, 0))
         self.window_combo.bind("<<ComboboxSelected>>", self._save_preferences)
         target_actions = ttk.Frame(target_settings, style="Toolbar.TFrame")
-        target_actions.grid(row=3, column=1, sticky="e", pady=(9, 0))
+        target_actions.grid(row=4, column=1, sticky="e", pady=(9, 0))
         ttk.Button(target_actions, text="刷新窗口列表", command=self.refresh_windows).pack(side="left")
         ttk.Button(target_actions, text="使用当前游戏窗口", command=self.use_current_game_window).pack(side="left", padx=(7, 0))
 
@@ -1194,6 +1210,7 @@ class FlashAlertDialog(tk.Toplevel):
 
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_windows()
+        self._update_target_mode_widgets()
 
     @classmethod
     def _sound_label(cls, mode: str) -> str:
@@ -1243,6 +1260,15 @@ class FlashAlertDialog(tk.Toplevel):
 
     def _save_preferences(self, _event: tk.Event | None = None) -> None:
         self.parent_app._save_settings()
+
+    def _target_mode_changed(self) -> None:
+        self._update_target_mode_widgets()
+        self._save_preferences()
+
+    def _update_target_mode_widgets(self) -> None:
+        keyword_mode = self.parent_app.flash_target_mode_var.get() == "keyword"
+        self.filter_entry.configure(state="normal" if keyword_mode else "disabled")
+        self.window_combo.configure(state="disabled" if keyword_mode else "readonly")
 
     def choose_wav(self) -> None:
         path = filedialog.askopenfilename(
@@ -1297,6 +1323,7 @@ class GuolingTaskOcr(tk.Tk):
         self.interval_var = tk.StringVar(value=f"{float(settings['interval_seconds']):g}")
         self.hotkey_var = tk.StringVar(value=str(settings["hotkey"]))
         self.flash_title_filter_var = tk.StringVar(value=str(settings["flash_title_filter"]))
+        self.flash_target_mode_var = tk.StringVar(value=str(settings["flash_target_mode"]))
         self.flash_window_var = tk.StringVar(value=str(settings["flash_window_title"]))
         self.flash_sound_mode_var = tk.StringVar(value=str(settings["flash_sound_mode"]))
         self.flash_wav_path_var = tk.StringVar(value=str(settings["flash_wav_path"]))
@@ -1692,7 +1719,12 @@ class GuolingTaskOcr(tk.Tk):
             except Empty:
                 break
             selected_hwnd = self.flash_window_handles.get(self.flash_window_var.get())
-            if not matches_event(event, self.flash_title_filter_var.get(), selected_hwnd):
+            if not matches_event(
+                event,
+                self.flash_title_filter_var.get(),
+                selected_hwnd,
+                self.flash_target_mode_var.get(),
+            ):
                 continue
             now = time.monotonic()
             last = self.flash_last_alert.get(event.hwnd)
@@ -1726,6 +1758,7 @@ class GuolingTaskOcr(tk.Tk):
             "hotkey": self.hotkey_var.get(),
             "window_title": self.preferred_window_title,
             "flash_title_filter": self.flash_title_filter_var.get(),
+            "flash_target_mode": self.flash_target_mode_var.get(),
             "flash_window_title": self._window_title_from_label(self.flash_window_var.get()),
             "flash_sound_mode": self.flash_sound_mode_var.get(),
             "flash_wav_path": self.flash_wav_path_var.get(),
