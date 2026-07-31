@@ -24,6 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .flash_alert import FlashEvent, FlashMonitor, list_visible_windows, matches_event, play_sound
+from .market_query import MARKET_WEB_URL, MarketClient, MarketQueryError, MarketSession, flatten_listings
 
 from PIL import Image, ImageEnhance, ImageGrab, ImageOps, ImageTk
 
@@ -118,6 +119,10 @@ DEFAULT_SETTINGS: dict[str, str | float] = {
     "flash_wav_path": "",
     "flash_cooldown_seconds": DEFAULT_FLASH_COOLDOWN_SECONDS,
     "flash_enabled": False,
+    "market_account": "",
+    "market_token": "",
+    "market_user_id": "",
+    "market_region": "得陇",
 }
 
 
@@ -166,7 +171,7 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
     if isinstance(window_title, str):
         settings["window_title"] = window_title
 
-    for key in ("flash_title_filter", "flash_window_title", "flash_wav_path"):
+    for key in ("flash_title_filter", "flash_window_title", "flash_wav_path", "market_account", "market_token", "market_user_id", "market_region"):
         value = payload.get(key)
         if isinstance(value, str):
             settings[key] = value
@@ -1299,12 +1304,118 @@ class FlashAlertDialog(tk.Toplevel):
         self.destroy()
 
 
+class MarketSettingsDialog(tk.Toplevel):
+    """Configure the user-authorized account used by the main-window market panel."""
+
+    REGIONS = ("得陇", "三足", "暗渡", "巧借", "群雄", "一代", "单刀", "杜康", "桃园", "抚琴", "十八", "云骑", "青梅")
+
+    def __init__(self, parent: "GuolingTaskOcr") -> None:
+        super().__init__(parent)
+        self.parent_app = parent
+        self.title("行情查询设置")
+        self.geometry("760x350")
+        self.minsize(640, 310)
+        self.transient(parent)
+        self.account_var = tk.StringVar(value=parent.market_session.account if parent.market_session else parent.market_account_var.get())
+        self.password_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="登录后可在主界面直接查询摊位和商行行情。")
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        account = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        account.grid(row=0, column=0, sticky="ew")
+        account.columnconfigure(1, weight=1)
+        account.columnconfigure(3, weight=1)
+        ttk.Label(account, text="账号授权", style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 9))
+        ttk.Label(account, text="账号", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(account, textvariable=self.account_var).grid(row=1, column=1, sticky="ew")
+        ttk.Label(account, text="密码", style="Field.TLabel").grid(row=1, column=2, sticky="e", padx=(14, 8))
+        password_entry = ttk.Entry(account, textvariable=self.password_var, show="*")
+        password_entry.grid(row=1, column=3, sticky="ew")
+        self.login_button = ttk.Button(account, text="登录", command=self._login, style="Primary.TButton")
+        self.login_button.grid(row=1, column=4, padx=(10, 0))
+        self.logout_button = ttk.Button(account, text="退出登录", command=self._logout)
+        self.logout_button.grid(row=1, column=5, padx=(7, 0))
+        ttk.Label(account, text="密码只用于本次登录，不会保存到本机。", style="Note.TLabel").grid(
+            row=2, column=0, columnspan=6, sticky="w", pady=(8, 0)
+        )
+
+        preferences = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        preferences.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(preferences, text="查询偏好", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 9))
+        ttk.Label(preferences, text="默认区服", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        region_combo = ttk.Combobox(
+            preferences, textvariable=parent.market_region_var, values=self.REGIONS, state="readonly", width=10
+        )
+        region_combo.grid(row=1, column=1, sticky="w")
+        region_combo.bind("<<ComboboxSelected>>", parent._save_settings)
+
+        footer = ttk.Frame(body)
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=self.status_var, style="Note.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="打开原网站", command=lambda: webbrowser.open(MARKET_WEB_URL)).grid(row=0, column=1)
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.after(100, password_entry.focus_set)
+
+    def _set_busy(self, busy: bool, message: str | None = None) -> None:
+        state = "disabled" if busy else "normal"
+        self.login_button.configure(state=state)
+        self.logout_button.configure(state=state)
+        if message:
+            self.status_var.set(message)
+
+    def _login(self) -> None:
+        account = self.account_var.get().strip()
+        password = self.password_var.get()
+        if not account or not password:
+            self.status_var.set("请输入账号和密码。")
+            return
+        self._set_busy(True, "正在登录...")
+
+        def worker() -> None:
+            try:
+                session = self.parent_app.market_client.login(account, password)
+            except MarketQueryError as error:
+                self.after(0, self._login_done, None, str(error))
+            else:
+                self.after(0, self._login_done, session, "")
+
+        threading.Thread(target=worker, name="market-login", daemon=True).start()
+
+    def _login_done(self, session: MarketSession | None, error: str) -> None:
+        if not self.winfo_exists():
+            return
+        self._set_busy(False)
+        if session is None:
+            self.status_var.set(f"登录失败：{error}")
+            return
+        self.password_var.set("")
+        self.parent_app.set_market_session(session)
+        self.account_var.set(session.account)
+        self.status_var.set(f"已登录“{session.account}”。")
+        self.parent_app.market_status_var.set("登录成功，可在主界面查询行情。")
+
+    def _logout(self) -> None:
+        self.password_var.set("")
+        self.parent_app.clear_market_session()
+        self.status_var.set("已退出登录，并清除本机保存的登录令牌。")
+        self.parent_app.market_status_var.set("请在行情设置中登录后再查询。")
+
+    def close(self) -> None:
+        self.parent_app._save_settings()
+        self.destroy()
+
+
 class GuolingTaskOcr(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("国令助手")
-        self.geometry("1240x860")
-        self.minsize(1020, 690)
+        self.geometry("1240x980")
+        self.minsize(1020, 760)
         self.configure(bg="#edf1f5")
         self.source_image: Image.Image | None = None
         self.crop_image: Image.Image | None = None
@@ -1329,6 +1440,21 @@ class GuolingTaskOcr(tk.Tk):
         self.flash_wav_path_var = tk.StringVar(value=str(settings["flash_wav_path"]))
         self.flash_cooldown_var = tk.StringVar(value=f"{float(settings['flash_cooldown_seconds']):g}")
         self.flash_enabled_var = tk.BooleanVar(value=bool(settings["flash_enabled"]))
+        self.market_account_var = tk.StringVar(value=str(settings["market_account"]))
+        self.market_region_var = tk.StringVar(value=str(settings["market_region"]))
+        market_token = str(settings["market_token"]).strip()
+        market_user_id = str(settings["market_user_id"]).strip()
+        self.market_session = (
+            MarketSession(self.market_account_var.get(), market_token, market_user_id)
+            if market_token and market_user_id
+            else None
+        )
+        self.market_client = MarketClient()
+        self.market_item_var = tk.StringVar()
+        self.market_status_var = tk.StringVar(value="请在“行情设置”中登录后查询摊位和商行信息。")
+        self.market_detail_var = tk.StringVar()
+        self.market_rows: dict[str, dict[str, str]] = {}
+        self.market_busy = False
         self.flash_events: Queue[FlashEvent] = Queue(maxsize=FLASH_EVENT_QUEUE_SIZE)
         self.flash_monitor = FlashMonitor(self.flash_events)
         self.flash_window_handles: dict[str, int] = {}
@@ -1451,12 +1577,24 @@ class GuolingTaskOcr(tk.Tk):
         style.map("TCheckbutton", background=[("active", surface)])
         style.configure("TCombobox", padding=(7, 5), font=(font, 9))
         style.configure("Result.TEntry", font=(font, 14, "bold"), padding=(10, 8))
+        style.configure("Market.TFrame", background="#2f1a15", borderwidth=1, relief="solid")
+        style.configure("MarketToolbar.TFrame", background="#2f1a15")
+        style.configure("MarketTitle.TLabel", background="#2f1a15", foreground="#ffd65a", font=(font, 12, "bold"))
+        style.configure("MarketField.TLabel", background="#2f1a15", foreground="#f7d9a5", font=(font, 9))
+        style.configure("MarketNote.TLabel", background="#2f1a15", foreground="#d8bda2", font=(font, 9))
+        style.configure("Market.TButton", font=(font, 9, "bold"), padding=(10, 6), foreground="#fff0bc", background="#71402b")
+        style.map("Market.TButton", background=[("active", "#8a5134"), ("disabled", "#5c4b43")])
+        style.configure("Market.Treeview", background="#3e2119", fieldbackground="#3e2119", foreground="#fff2d1", rowheight=29, font=(font, 9), borderwidth=0)
+        style.map("Market.Treeview", background=[("selected", "#765039")], foreground=[("selected", "#fff7d6")])
+        style.configure("Market.Treeview.Heading", background="#5a2d1c", foreground="#ffe16d", font=(font, 9, "bold"), relief="flat", padding=(8, 6))
+        style.map("Market.Treeview.Heading", background=[("active", "#754126")])
 
     def _build(self) -> None:
         root = ttk.Frame(self, padding=14)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(3, weight=1)
+        root.rowconfigure(4, weight=1)
 
         header = ttk.Frame(root, style="Header.TFrame", padding=(18, 14))
         header.grid(row=0, column=0, sticky="ew")
@@ -1522,6 +1660,7 @@ class GuolingTaskOcr(tk.Tk):
         ttk.Button(settings_tools, text="录制", command=self.record_hotkey).pack(side="left", padx=(6, 0))
         ttk.Button(settings_tools, text="怪物词表", command=self.open_monster_lookup).pack(side="left", padx=(14, 0))
         ttk.Button(settings_tools, text="自定义词库", command=self.open_custom_vocabulary).pack(side="left", padx=(7, 0))
+        ttk.Button(settings_tools, text="行情设置", command=self.open_market_settings).pack(side="left", padx=(7, 0))
         ttk.Checkbutton(
             settings_tools,
             text="闪烁提醒",
@@ -1591,9 +1730,72 @@ class GuolingTaskOcr(tk.Tk):
         raw_scroll.grid(row=0, column=1, sticky="ns")
         self.raw_text.configure(yscrollcommand=raw_scroll.set)
 
+        market = ttk.Frame(root, style="Market.TFrame", padding=10)
+        market.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        market.columnconfigure(0, weight=1)
+        market.rowconfigure(2, weight=1)
+
+        market_header = ttk.Frame(market, style="MarketToolbar.TFrame")
+        market_header.grid(row=0, column=0, sticky="ew")
+        market_header.columnconfigure(0, weight=1)
+        ttk.Label(market_header, text="物品行情", style="MarketTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(market_header, text="行情设置", command=self.open_market_settings, style="Market.TButton").grid(row=0, column=1, sticky="e")
+
+        market_controls = ttk.Frame(market, style="MarketToolbar.TFrame")
+        market_controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        market_controls.columnconfigure(3, weight=1)
+        ttk.Label(market_controls, text="区服", style="MarketField.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 7))
+        market_region = ttk.Combobox(
+            market_controls,
+            textvariable=self.market_region_var,
+            values=MarketSettingsDialog.REGIONS,
+            state="readonly",
+            width=8,
+        )
+        market_region.grid(row=0, column=1, sticky="w")
+        market_region.bind("<<ComboboxSelected>>", self._save_settings)
+        ttk.Label(market_controls, text="物品名", style="MarketField.TLabel").grid(row=0, column=2, sticky="e", padx=(14, 7))
+        self.market_item_entry = ttk.Entry(market_controls, textvariable=self.market_item_var, style="Result.TEntry")
+        self.market_item_entry.grid(row=0, column=3, sticky="ew")
+        self.market_query_button = ttk.Button(market_controls, text="查询行情", command=self.query_market, style="Market.TButton")
+        self.market_query_button.grid(row=0, column=4, padx=(9, 0))
+        ttk.Button(market_controls, text="使用 OCR 物品", command=self.use_ocr_item_for_market, style="Market.TButton").grid(row=0, column=5, padx=(7, 0))
+        ttk.Button(market_controls, text="打开原网站", command=lambda: webbrowser.open(MARKET_WEB_URL), style="Market.TButton").grid(row=0, column=6, padx=(7, 0))
+
+        market_table_holder = ttk.Frame(market, style="Market.TFrame")
+        market_table_holder.grid(row=2, column=0, sticky="nsew")
+        market_table_holder.rowconfigure(0, weight=1)
+        market_table_holder.columnconfigure(0, weight=1)
+        columns = ("source", "item_quantity", "owner", "stall_info", "coordinate", "price")
+        self.market_table = ttk.Treeview(
+            market_table_holder, columns=columns, show="headings", selectmode="browse", style="Market.Treeview"
+        )
+        for column, label, width, stretch in (
+            ("source", "来源", 62, False),
+            ("item_quantity", "物品名*数量", 190, True),
+            ("owner", "卖家", 150, True),
+            ("stall_info", "摊位/商行信息", 145, True),
+            ("coordinate", "位置", 250, True),
+            ("price", "单价", 95, False),
+        ):
+            self.market_table.heading(column, text=label)
+            self.market_table.column(column, width=width, minwidth=60, anchor="w", stretch=stretch)
+        self.market_table.tag_configure("odd", background="#3e2119")
+        self.market_table.tag_configure("even", background="#4d2920")
+        self.market_table.grid(row=0, column=0, sticky="nsew")
+        market_scrollbar = ttk.Scrollbar(market_table_holder, orient="vertical", command=self.market_table.yview)
+        market_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.market_table.configure(yscrollcommand=market_scrollbar.set)
+        self.market_table.bind("<<TreeviewSelect>>", self._show_market_detail)
+
+        market_footer = ttk.Frame(market, style="MarketToolbar.TFrame")
+        market_footer.grid(row=3, column=0, sticky="ew", pady=(7, 0))
+        ttk.Label(market_footer, textvariable=self.market_status_var, style="MarketNote.TLabel").pack(anchor="w")
+        ttk.Label(market_footer, textvariable=self.market_detail_var, style="MarketNote.TLabel", wraplength=1160).pack(anchor="w", pady=(3, 0))
+
         self.status_var = tk.StringVar(value="就绪。选择游戏窗口后即可截取并识别。")
         status = ttk.Label(root, textvariable=self.status_var, style="Status.TLabel", padding=(12, 8))
-        status.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        status.grid(row=5, column=0, sticky="ew", pady=(12, 0))
 
     def _register_hotkey(self) -> None:
         try:
@@ -1654,6 +1856,102 @@ class GuolingTaskOcr(tk.Tk):
         except AttributeError:
             pass
         self.custom_vocabulary = CustomVocabularyDialog(self)
+
+    def open_market_settings(self) -> None:
+        """Open the separate login and default-region settings dialog."""
+        try:
+            if self.market_settings.winfo_exists():
+                self.market_settings.deiconify()
+                self.market_settings.lift()
+                self.market_settings.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.market_settings = MarketSettingsDialog(self)
+
+    def set_market_session(self, session: MarketSession) -> None:
+        self.market_session = session
+        self.market_account_var.set(session.account)
+        self._save_settings()
+        self.market_status_var.set(f"已登录“{session.account}”，可查询摊位、商行和寄卖行情。")
+
+    def clear_market_session(self) -> None:
+        """Remove the locally stored third-party website authorization."""
+        self.market_session = None
+        self._save_settings()
+        self.market_status_var.set("请在“行情设置”中登录后查询。")
+
+    def use_ocr_item_for_market(self) -> None:
+        item = self.item_var.get().strip()
+        if not item:
+            self.market_status_var.set("当前没有 OCR 物品名，请手动输入后查询。")
+            return
+        self.market_item_var.set(item)
+        self.market_item_entry.focus_set()
+        self.market_status_var.set(f"已带入 OCR 物品“{item}”。")
+
+    def query_market(self) -> None:
+        session = self.market_session
+        keyword = self.market_item_var.get().strip()
+        region = self.market_region_var.get().strip()
+        if self.market_busy:
+            return
+        if session is None:
+            self.market_status_var.set("请先打开“行情设置”登录账号。")
+            return
+        if not keyword:
+            self.market_status_var.set("请输入物品名，或使用当前 OCR 结果。")
+            self.market_item_entry.focus_set()
+            return
+        if not region:
+            self.market_status_var.set("请在“行情设置”中选择区服。")
+            return
+        self._set_market_busy(True, f"正在查询“{keyword}”的摊位和商行行情...")
+
+        def worker() -> None:
+            try:
+                rows = flatten_listings(self.market_client.query_listings(session, region, keyword))
+            except MarketQueryError as error:
+                self.after(0, self._market_query_done, [], str(error))
+            else:
+                self.after(0, self._market_query_done, rows, "")
+
+        threading.Thread(target=worker, name="market-query", daemon=True).start()
+
+    def _set_market_busy(self, busy: bool, message: str | None = None) -> None:
+        self.market_busy = busy
+        self.market_query_button.configure(state="disabled" if busy else "normal")
+        if message:
+            self.market_status_var.set(message)
+
+    def _market_query_done(self, rows: list[dict[str, str]], error: str) -> None:
+        if not self.winfo_exists():
+            return
+        self._set_market_busy(False)
+        for item_id in self.market_table.get_children():
+            self.market_table.delete(item_id)
+        self.market_rows.clear()
+        self.market_detail_var.set("")
+        if error:
+            self.market_status_var.set(f"查询失败：{error}")
+            return
+        for index, row in enumerate(rows):
+            item_id = str(index)
+            self.market_rows[item_id] = row
+            item_quantity = f"{row['name']}*{row['quantity']}" if row["quantity"] != "-" else row["name"]
+            self.market_table.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(row["source"], item_quantity, row["owner"], row["stall_info"], row["coordinate"], row["price"]),
+                tags=("even" if index % 2 == 0 else "odd",),
+            )
+        self.market_status_var.set(f"找到 {len(rows)} 条“{self.market_item_var.get().strip()}”行情记录。")
+
+    def _show_market_detail(self, _event: tk.Event) -> None:
+        selected = self.market_table.selection()
+        if selected:
+            self.market_detail_var.set(self.market_rows[selected[0]]["detail"])
 
     def open_about_dialog(self) -> None:
         """Open one reusable version and update-information window."""
@@ -1764,6 +2062,10 @@ class GuolingTaskOcr(tk.Tk):
             "flash_wav_path": self.flash_wav_path_var.get(),
             "flash_cooldown_seconds": self._flash_cooldown_seconds(),
             "flash_enabled": self.flash_enabled_var.get(),
+            "market_account": self.market_account_var.get(),
+            "market_token": self.market_session.token if self.market_session else "",
+            "market_user_id": self.market_session.user_id if self.market_session else "",
+            "market_region": self.market_region_var.get(),
         })
 
     def _flash_cooldown_seconds(self) -> float:
@@ -2177,6 +2479,7 @@ class GuolingTaskOcr(tk.Tk):
         self.recognize_button.configure(state="normal")
         if candidate:
             self.item_var.set(candidate)
+            self.market_item_var.set(candidate)
             self.last_valid_item = candidate
             self.copy_item(silent=True)
             self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板。")

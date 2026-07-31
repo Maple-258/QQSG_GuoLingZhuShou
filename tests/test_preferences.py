@@ -39,6 +39,10 @@ class PreferencesTests(unittest.TestCase):
                     "flash_wav_path": "C:\\alert.wav",
                     "flash_cooldown_seconds": 4.5,
                     "flash_enabled": True,
+                    "market_account": "market-user",
+                    "market_token": "market-token",
+                    "market_user_id": "12345",
+                    "market_region": "得陇",
                 },
                 settings_path,
             )
@@ -56,6 +60,10 @@ class PreferencesTests(unittest.TestCase):
                     "flash_wav_path": "C:\\alert.wav",
                     "flash_cooldown_seconds": 4.5,
                     "flash_enabled": True,
+                    "market_account": "market-user",
+                    "market_token": "market-token",
+                    "market_user_id": "12345",
+                    "market_region": "得陇",
                 },
             )
 
