@@ -11,10 +11,15 @@ import logging
 import sys
 import traceback
 import ctypes
+import webbrowser
+import urllib.error
+import urllib.request
 from ctypes import wintypes
 from functools import lru_cache
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+from . import __version__
 
 from PIL import Image, ImageEnhance, ImageGrab, ImageOps, ImageTk
 
@@ -42,6 +47,11 @@ if not DATA_DIR.is_dir():
     # Allows development runs from the pre-package layout during migration.
     DATA_DIR = PACKAGE_DIR
 RUNTIME_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else PACKAGE_DIR.parents[1]
+BUNDLED_RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", RUNTIME_DIR))
+CHANGELOG_PATH = BUNDLED_RESOURCE_DIR / "CHANGELOG.md"
+GITHUB_REPOSITORY = "Maple-258/QQSG_GuoLingZhuShou"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
+GITHUB_LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 
 
 def _persistent_data_dir() -> Path:
@@ -75,6 +85,7 @@ TASK_CONTEXT_TERMS = ("任务", "国令", "NPC", "需要", "收集", "提交", "
 ITEM_ALIASES_PATH = DATA_DIR / "道具OCR纠错.json"
 ITEM_VOCABULARY_PATH = DATA_DIR / "官方道具词表.json"
 MONSTER_VOCABULARY_PATH = DATA_DIR / "官方怪物词表.json"
+CUSTOM_ITEM_VOCABULARY_PATH = APP_DATA_DIR / "custom_item_vocabulary.json"
 EXCLUDED_WORDS = {
     "任务追踪", "国令慕贤", "高级国令", "当前", "任务", "目标", "进度", "完成",
     "可用", "点击", "道具", "物品", "材料", "需求", "需要", "所需", "收集", "寻找",
@@ -131,6 +142,43 @@ def save_user_settings(settings: dict[str, str | float], settings_path: Path = S
         settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         logging.warning("Unable to save settings to %s", settings_path, exc_info=True)
+
+
+def load_changelog(changelog_path: Path = CHANGELOG_PATH) -> str:
+    """Load the changelog bundled with the app, with a useful fallback for source runs."""
+    try:
+        return changelog_path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return "未找到本地更新日志。请前往 GitHub Releases 查看版本记录。"
+
+
+def parse_version(version: str) -> tuple[int, int, int] | None:
+    """Parse release tags such as v1.2.0 without adding a dependency."""
+    match = re.fullmatch(r"v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", version.strip())
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def is_newer_version(candidate: str, current: str = __version__) -> bool:
+    """Return whether a GitHub release tag is newer than the installed version."""
+    candidate_version = parse_version(candidate)
+    current_version = parse_version(current)
+    return candidate_version is not None and current_version is not None and candidate_version > current_version
+
+
+def fetch_latest_release(
+    api_url: str = GITHUB_LATEST_RELEASE_API_URL,
+) -> dict[str, str]:
+    """Read the latest public GitHub Release metadata without downloading an executable."""
+    request = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "GuoLingZhuShou"})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    tag_name = str(payload.get("tag_name", "")).strip()
+    html_url = str(payload.get("html_url", "")).strip()
+    if not tag_name or not html_url:
+        raise ValueError("GitHub Release 响应缺少版本信息")
+    return {"tag_name": tag_name, "html_url": html_url}
 
 
 def ocr_model_directories(model_root: Path = OCR_MODEL_DIR) -> dict[str, str]:
@@ -289,6 +337,59 @@ def load_official_item_names() -> frozenset[str]:
         return frozenset()
 
 
+@lru_cache(maxsize=4)
+def load_custom_item_vocabulary(
+    vocabulary_path: Path = CUSTOM_ITEM_VOCABULARY_PATH,
+) -> tuple[frozenset[str], dict[str, str]]:
+    """Load user-maintained names and explicit OCR corrections."""
+    try:
+        data = json.loads(vocabulary_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return frozenset(), {}
+        items = data.get("items", [])
+        aliases = data.get("aliases", {})
+        if not isinstance(items, list) or not isinstance(aliases, dict):
+            return frozenset(), {}
+        names = {str(item).strip() for item in items if str(item).strip()}
+        normalized_aliases = {
+            str(source).strip(): str(target).strip()
+            for source, target in aliases.items()
+            if str(source).strip() and str(target).strip()
+        }
+        names.update(normalized_aliases.values())
+        return frozenset(names), normalized_aliases
+    except (OSError, ValueError, TypeError):
+        return frozenset(), {}
+
+
+def save_custom_item_vocabulary(
+    items: set[str] | frozenset[str] | list[str],
+    aliases: dict[str, str],
+    vocabulary_path: Path = CUSTOM_ITEM_VOCABULARY_PATH,
+) -> None:
+    """Save validated custom vocabulary and make it available immediately."""
+    normalized_items = {str(item).strip() for item in items if str(item).strip()}
+    normalized_aliases = {
+        str(source).strip(): str(target).strip()
+        for source, target in aliases.items()
+        if str(source).strip() and str(target).strip()
+    }
+    normalized_items.update(normalized_aliases.values())
+    payload = {
+        "items": sorted(normalized_items),
+        "aliases": dict(sorted(normalized_aliases.items())),
+    }
+    vocabulary_path.parent.mkdir(parents=True, exist_ok=True)
+    vocabulary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    load_custom_item_vocabulary.cache_clear()
+
+
+def load_all_item_names() -> frozenset[str]:
+    """Combine official and user-provided names without altering bundled data."""
+    custom_names, _aliases = load_custom_item_vocabulary()
+    return load_official_item_names() | custom_names
+
+
 @lru_cache(maxsize=1)
 def load_official_monsters() -> tuple[dict[str, str], ...]:
     """读取随程序发布的官网怪物资料，用于离线查询。"""
@@ -358,8 +459,8 @@ def _edit_distance(left: str, right: str) -> int:
 
 
 def match_official_item_name(candidate: str) -> str:
-    """只接受唯一的最接近命中，防止把不相关的文字强行替换。"""
-    names = load_official_item_names()
+    """Only accept a unique nearest official or custom vocabulary match."""
+    names = load_all_item_names()
     if candidate in names or len(candidate) < 3:
         return candidate
 
@@ -381,7 +482,8 @@ def match_official_item_name(candidate: str) -> str:
 
 
 def correct_item_name(candidate: str) -> str:
-    aliases = load_item_aliases()
+    _custom_names, custom_aliases = load_custom_item_vocabulary()
+    aliases = {**load_item_aliases(), **custom_aliases}
     corrected = aliases.get(candidate, candidate)
     if corrected == candidate:
         for mistaken, expected in aliases.items():
@@ -707,12 +809,234 @@ class MonsterLookupDialog(tk.Toplevel):
         self.result_var.set(f"已复制“{monster['name']}”。")
 
 
+class CustomVocabularyDialog(tk.Toplevel):
+    """Editor for user-provided item names and explicit OCR corrections."""
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("自定义词库")
+        self.geometry("760x510")
+        self.minsize(620, 390)
+        self.transient(parent)
+        custom_names, custom_aliases = load_custom_item_vocabulary()
+        self.items = set(custom_names)
+        self.aliases = custom_aliases.copy()
+        self.name_var = tk.StringVar()
+        self.alias_var = tk.StringVar()
+        self.status_var = tk.StringVar()
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        ttk.Label(body, text="自定义任务物品词库", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            body,
+            text="只填写正确名称即可参与单字符 OCR 纠错；识别差异较大时，再填写对应的 OCR 误识名称。",
+            style="Note.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
+
+        editor = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        editor.grid(row=2, column=0, sticky="nsew")
+        editor.columnconfigure(1, weight=1)
+        editor.rowconfigure(2, weight=1)
+        ttk.Label(editor, text="正确名称", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        name_entry = ttk.Entry(editor, textvariable=self.name_var, style="Result.TEntry")
+        name_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Label(editor, text="OCR 误识名称（可选）", style="Field.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        alias_entry = ttk.Entry(editor, textvariable=self.alias_var)
+        alias_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        actions = ttk.Frame(editor, style="Surface.TFrame")
+        actions.grid(row=0, column=2, rowspan=2, sticky="ns", padx=(10, 0))
+        ttk.Button(actions, text="添加 / 更新", command=self._add_or_update, style="Primary.TButton").pack(fill="x")
+        ttk.Button(actions, text="删除误识词", command=self._delete_alias).pack(fill="x", pady=(7, 0))
+        ttk.Button(actions, text="清空输入", command=self._clear_inputs).pack(fill="x", pady=(7, 0))
+
+        table_holder = ttk.Frame(editor, style="Surface.TFrame")
+        table_holder.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
+        table_holder.columnconfigure(0, weight=1)
+        table_holder.rowconfigure(0, weight=1)
+        self.table = ttk.Treeview(table_holder, columns=("name", "aliases"), show="headings", selectmode="browse")
+        self.table.heading("name", text="正确名称")
+        self.table.heading("aliases", text="已设置的 OCR 误识名称")
+        self.table.column("name", width=210, minwidth=140, anchor="w", stretch=False)
+        self.table.column("aliases", width=440, minwidth=220, anchor="w")
+        self.table.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(table_holder, orient="vertical", command=self.table.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.table.configure(yscrollcommand=scrollbar.set)
+
+        footer = ttk.Frame(body)
+        footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(footer, text="删除所选名称", command=self._delete_selected).pack(side="right")
+        ttk.Label(footer, textvariable=self.status_var, style="Note.TLabel").pack(side="left")
+        self.table.bind("<<TreeviewSelect>>", self._select_item)
+        self._refresh_table()
+        self.after(100, name_entry.focus_set)
+
+    def _refresh_table(self) -> None:
+        for item_id in self.table.get_children():
+            self.table.delete(item_id)
+        for name in sorted(self.items):
+            aliases = sorted(source for source, target in self.aliases.items() if target == name)
+            self.table.insert("", "end", iid=name, values=(name, "、".join(aliases) or "-"))
+        self.status_var.set(f"已保存 {len(self.items)} 个自定义名称、{len(self.aliases)} 条纠错规则。")
+
+    def _save(self) -> bool:
+        try:
+            save_custom_item_vocabulary(self.items, self.aliases)
+        except OSError as error:
+            messagebox.showerror("保存失败", f"无法保存自定义词库：{error}", parent=self)
+            return False
+        self._refresh_table()
+        return True
+
+    def _add_or_update(self) -> None:
+        name = self.name_var.get().strip()
+        alias = self.alias_var.get().strip()
+        if not name:
+            messagebox.showinfo("提示", "请填写正确名称。", parent=self)
+            return
+        self.items.add(name)
+        if alias and alias != name:
+            self.aliases[alias] = name
+        elif alias == name:
+            self.aliases.pop(alias, None)
+        if self._save():
+            self._clear_inputs()
+            self.status_var.set(f"已添加“{name}”，OCR 识别将立即使用该词库。")
+
+    def _delete_alias(self) -> None:
+        alias = self.alias_var.get().strip()
+        if not alias:
+            messagebox.showinfo("提示", "请先填写要删除的 OCR 误识名称。", parent=self)
+            return
+        if alias not in self.aliases:
+            messagebox.showinfo("提示", f"未找到“{alias}”对应的纠错规则。", parent=self)
+            return
+        del self.aliases[alias]
+        if self._save():
+            self.alias_var.set("")
+            self.status_var.set(f"已删除“{alias}”的纠错规则。")
+
+    def _delete_selected(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要删除的自定义名称。", parent=self)
+            return
+        name = selected[0]
+        self.items.discard(name)
+        self.aliases = {source: target for source, target in self.aliases.items() if target != name}
+        if self._save():
+            self._clear_inputs()
+            self.status_var.set(f"已删除“{name}”及其纠错规则。")
+
+    def _select_item(self, _event: tk.Event) -> None:
+        selected = self.table.selection()
+        if not selected:
+            return
+        name = selected[0]
+        aliases = sorted(source for source, target in self.aliases.items() if target == name)
+        self.name_var.set(name)
+        self.alias_var.set(aliases[0] if aliases else "")
+
+    def _clear_inputs(self) -> None:
+        self.name_var.set("")
+        self.alias_var.set("")
+        for item_id in self.table.selection():
+            self.table.selection_remove(item_id)
+
+
+class AboutDialog(tk.Toplevel):
+    """Show the installed version, bundled changelog, and GitHub release status."""
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("关于与更新")
+        self.geometry("760x560")
+        self.minsize(620, 420)
+        self.transient(parent)
+        self.release_url = GITHUB_RELEASES_URL
+        self.update_status_var = tk.StringVar(value="可检查 GitHub 上的最新 Release。")
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        ttk.Label(body, text="国令助手", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text=f"当前版本：v{__version__}", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 10))
+
+        changelog_holder = ttk.Frame(body, style="Surface.TFrame", padding=1)
+        changelog_holder.grid(row=2, column=0, sticky="nsew")
+        changelog_holder.rowconfigure(0, weight=1)
+        changelog_holder.columnconfigure(0, weight=1)
+        changelog_text = tk.Text(
+            changelog_holder,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            background="#f8fafc",
+            foreground="#27364a",
+            font=("Microsoft YaHei UI", 9),
+            padx=12,
+            pady=10,
+        )
+        changelog_text.grid(row=0, column=0, sticky="nsew")
+        changelog_scrollbar = ttk.Scrollbar(changelog_holder, orient="vertical", command=changelog_text.yview)
+        changelog_scrollbar.grid(row=0, column=1, sticky="ns")
+        changelog_text.configure(yscrollcommand=changelog_scrollbar.set)
+        changelog_text.insert("1.0", load_changelog())
+        changelog_text.configure(state="disabled")
+
+        footer = ttk.Frame(body)
+        footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=self.update_status_var, style="Note.TLabel").grid(row=0, column=0, sticky="w")
+        self.check_button = ttk.Button(footer, text="检查更新", command=self._check_for_updates)
+        self.check_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(footer, text="打开 Release 页面", command=self._open_release_page).grid(row=0, column=2, padx=(8, 0))
+
+    def _check_for_updates(self) -> None:
+        self.check_button.configure(state="disabled")
+        self.update_status_var.set("正在检查 GitHub Release……")
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self) -> None:
+        try:
+            release = fetch_latest_release()
+        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as error:
+            self.after(0, lambda message=str(error): self._show_update_error(message))
+            return
+        self.after(0, lambda: self._show_update_result(release))
+
+    def _show_update_error(self, message: str) -> None:
+        self.check_button.configure(state="normal")
+        self.update_status_var.set(f"检查更新失败：{message}。")
+
+    def _show_update_result(self, release: dict[str, str]) -> None:
+        self.check_button.configure(state="normal")
+        self.release_url = release["html_url"]
+        latest = release["tag_name"]
+        if is_newer_version(latest):
+            self.update_status_var.set(f"发现新版本 {latest}。请在 Release 页面下载完整 EXE。")
+        elif is_newer_version(__version__, latest):
+            self.update_status_var.set(f"当前版本 v{__version__} 高于 GitHub Release {latest}，可能尚未发布。")
+        else:
+            self.update_status_var.set(f"当前已是最新版本（GitHub 最新：{latest}）。")
+
+    def _open_release_page(self) -> None:
+        webbrowser.open_new_tab(self.release_url)
+
+
 class GuolingTaskOcr(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("国令助手")
-        self.geometry("1140x790")
-        self.minsize(960, 620)
+        self.geometry("1240x820")
+        self.minsize(1020, 650)
         self.configure(bg="#edf1f5")
         self.source_image: Image.Image | None = None
         self.crop_image: Image.Image | None = None
@@ -862,9 +1186,9 @@ class GuolingTaskOcr(tk.Tk):
 
         source = ttk.Frame(root, style="Surface.TFrame", padding=(14, 11))
         source.grid(row=1, column=0, sticky="ew", pady=(12, 8))
-        source.columnconfigure(1, weight=1)
+        source.columnconfigure(1, weight=1, minsize=390)
         ttk.Label(source, text="游戏窗口", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.window_combo = ttk.Combobox(source, textvariable=self.window_var, state="readonly", width=36)
+        self.window_combo = ttk.Combobox(source, textvariable=self.window_var, state="readonly", width=46)
         self.window_combo.grid(row=0, column=1, sticky="ew")
         ttk.Button(source, text="刷新", command=self.refresh_game_windows).grid(row=0, column=2, padx=(8, 14))
         ttk.Label(source, text="截图方式", style="Field.TLabel").grid(row=0, column=3, padx=(0, 8))
@@ -879,7 +1203,6 @@ class GuolingTaskOcr(tk.Tk):
         self.capture_method_combo.bind("<<ComboboxSelected>>", self._save_settings)
         self.window_combo.bind("<<ComboboxSelected>>", self._save_settings)
         ttk.Button(source, text="截取窗口", command=self.capture_selected_window, style="Primary.TButton").grid(row=0, column=5, padx=(12, 0))
-        ttk.Button(source, text="怪物词表", command=self.open_monster_lookup).grid(row=0, column=6, padx=(8, 0))
 
         tools = ttk.Frame(root, style="Surface.TFrame", padding=(14, 9))
         tools.grid(row=2, column=0, sticky="ew", pady=(0, 12))
@@ -905,6 +1228,9 @@ class GuolingTaskOcr(tk.Tk):
         ttk.Label(tools, text="快捷键", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(tools, textvariable=self.hotkey_var, style="Field.TLabel", width=14).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
         ttk.Button(tools, text="录制", command=self.record_hotkey).grid(row=1, column=2, padx=(6, 0), pady=(8, 0))
+        ttk.Button(tools, text="怪物词表", command=self.open_monster_lookup).grid(row=1, column=3, padx=(12, 0), pady=(8, 0))
+        ttk.Button(tools, text="自定义词库", command=self.open_custom_vocabulary).grid(row=1, column=4, padx=(7, 0), pady=(8, 0))
+        ttk.Button(tools, text="关于 / 更新", command=self.open_about_dialog).grid(row=1, column=5, padx=(7, 0), pady=(8, 0))
         ttk.Button(tools, text="快捷识别", command=self.quick_capture_and_recognize, style="Quick.TButton").grid(row=1, column=8, padx=(8, 0), pady=(8, 0))
         self.recognize_button = ttk.Button(tools, text="识别并复制", command=self.recognize, state="disabled", style="Primary.TButton")
         self.recognize_button.grid(row=1, column=9, padx=(8, 0), pady=(8, 0))
@@ -1006,6 +1332,30 @@ class GuolingTaskOcr(tk.Tk):
         except AttributeError:
             pass
         self.monster_lookup = MonsterLookupDialog(self)
+
+    def open_custom_vocabulary(self) -> None:
+        """Open one reusable editor for user-provided item vocabulary."""
+        try:
+            if self.custom_vocabulary.winfo_exists():
+                self.custom_vocabulary.deiconify()
+                self.custom_vocabulary.lift()
+                self.custom_vocabulary.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.custom_vocabulary = CustomVocabularyDialog(self)
+
+    def open_about_dialog(self) -> None:
+        """Open one reusable version and update-information window."""
+        try:
+            if self.about_dialog.winfo_exists():
+                self.about_dialog.deiconify()
+                self.about_dialog.lift()
+                self.about_dialog.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.about_dialog = AboutDialog(self)
 
     @staticmethod
     def _window_title_from_label(label: str) -> str:
