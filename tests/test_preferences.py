@@ -36,6 +36,7 @@ class PreferencesTests(unittest.TestCase):
                     "flash_sound_mode": "beep",
                     "flash_wav_path": "C:\\alert.wav",
                     "flash_cooldown_seconds": 4.5,
+                    "flash_enabled": True,
                 },
                 settings_path,
             )
@@ -51,6 +52,7 @@ class PreferencesTests(unittest.TestCase):
                     "flash_sound_mode": "beep",
                     "flash_wav_path": "C:\\alert.wav",
                     "flash_cooldown_seconds": 4.5,
+                    "flash_enabled": True,
                 },
             )
 

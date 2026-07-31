@@ -116,6 +116,7 @@ DEFAULT_SETTINGS: dict[str, str | float] = {
     "flash_sound_mode": "system",
     "flash_wav_path": "",
     "flash_cooldown_seconds": DEFAULT_FLASH_COOLDOWN_SECONDS,
+    "flash_enabled": False,
 }
 
 
@@ -170,6 +171,10 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
         flash_cooldown = DEFAULT_FLASH_COOLDOWN_SECONDS
     if MIN_FLASH_COOLDOWN_SECONDS <= flash_cooldown <= MAX_FLASH_COOLDOWN_SECONDS:
         settings["flash_cooldown_seconds"] = flash_cooldown
+
+    flash_enabled = payload.get("flash_enabled")
+    if isinstance(flash_enabled, bool):
+        settings["flash_enabled"] = flash_enabled
     return settings
 
 
@@ -1085,12 +1090,9 @@ class FlashAlertDialog(tk.Toplevel):
         self.geometry("960x650")
         self.minsize(800, 530)
         self.transient(parent)
-        self.events: Queue[FlashEvent] = Queue(maxsize=FLASH_EVENT_QUEUE_SIZE)
-        self.monitor = FlashMonitor(self.events)
         self.window_handles: dict[str, int] = {}
-        self.last_alert: dict[int, float] = {}
         self.reports: list[str] = []
-        self.status_var = tk.StringVar(value="正在启动窗口闪烁监听……")
+        self.status_var = parent.flash_status_var
         self.sound_label_var = tk.StringVar(value=self._sound_label(parent.flash_sound_mode_var.get()))
 
         body = ttk.Frame(self, padding=14)
@@ -1177,18 +1179,12 @@ class FlashAlertDialog(tk.Toplevel):
 
         footer = ttk.Frame(body)
         footer.grid(row=5, column=0, sticky="ew", pady=(10, 0))
-        footer.columnconfigure(3, weight=1)
-        self.start_button = ttk.Button(footer, text="开始监听", command=self.start_monitor, style="Primary.TButton")
-        self.start_button.grid(row=0, column=0)
-        self.stop_button = ttk.Button(footer, text="停止监听", command=self.stop_monitor)
-        self.stop_button.grid(row=0, column=1, padx=(7, 0))
-        ttk.Button(footer, text="测试声音", command=self.test_sound).grid(row=0, column=2, padx=(7, 0))
-        ttk.Label(footer, textvariable=self.status_var, style="Note.TLabel").grid(row=0, column=3, sticky="w", padx=(12, 0))
+        footer.columnconfigure(1, weight=1)
+        ttk.Button(footer, text="测试声音", command=self.test_sound).grid(row=0, column=0)
+        ttk.Label(footer, textvariable=self.status_var, style="Note.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_windows()
-        self.start_monitor()
-        self.after(100, self.process_events)
 
     @classmethod
     def _sound_label(cls, mode: str) -> str:
@@ -1209,15 +1205,10 @@ class FlashAlertDialog(tk.Toplevel):
         self._add_report("已清空检测报告")
 
     def refresh_windows(self) -> None:
-        previous_title = self.parent_app._window_title_from_label(self.parent_app.flash_window_var.get())
-        self.window_handles.clear()
-        for hwnd, title in list_visible_windows():
-            label = f"{title}  [窗口 {hwnd}]"
-            self.window_handles[label] = hwnd
+        self.parent_app.refresh_flash_windows()
+        self.window_handles = self.parent_app.flash_window_handles
         values = tuple(self.window_handles)
         self.window_combo.configure(values=values)
-        restored = next((label for label in values if self.parent_app._window_title_from_label(label) == previous_title), "")
-        self.parent_app.flash_window_var.set(restored)
         self._add_report(f"刷新窗口列表：找到 {len(values)} 个可见窗口")
 
     def use_current_game_window(self) -> None:
@@ -1263,52 +1254,12 @@ class FlashAlertDialog(tk.Toplevel):
         self.parent_app.flash_cooldown_var.set(f"{value:g}")
         return value
 
-    def start_monitor(self) -> None:
-        try:
-            self.monitor.start()
-        except RuntimeError as error:
-            self.status_var.set(f"监听启动失败：{error}")
-            self._add_report(f"监听启动失败：{error}")
-            return
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.status_var.set("监听中")
-        self._add_report("开始监听窗口闪烁事件")
-
-    def stop_monitor(self) -> None:
-        self.monitor.stop()
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
-        self.status_var.set("已停止监听")
-        self._add_report("停止监听")
-
     def test_sound(self) -> None:
         success = play_sound(self.parent_app.flash_sound_mode_var.get(), self.parent_app.flash_wav_path_var.get())
         self.status_var.set("已播放测试声音" if success else "测试声音播放失败")
         self._add_report("测试声音播放成功" if success else "测试声音播放失败")
 
-    def process_events(self) -> None:
-        for _ in range(FLASH_EVENTS_PER_TICK):
-            try:
-                event = self.events.get_nowait()
-            except Empty:
-                break
-            selected_hwnd = self.window_handles.get(self.parent_app.flash_window_var.get())
-            if not matches_event(event, self.parent_app.flash_title_filter_var.get(), selected_hwnd):
-                continue
-            now = time.monotonic()
-            last = self.last_alert.get(event.hwnd)
-            if last is not None and now - last < self._cooldown_seconds():
-                continue
-            self.last_alert[event.hwnd] = now
-            success = play_sound(self.parent_app.flash_sound_mode_var.get(), self.parent_app.flash_wav_path_var.get())
-            self.status_var.set(f"{'已提醒' if success else '声音播放失败'}：{event.title}")
-            self._add_report(f"{'已提醒' if success else '声音播放失败'}：{event.source}，{event.title}")
-        if self.winfo_exists():
-            self.after(100, self.process_events)
-
     def close(self) -> None:
-        self.monitor.stop()
         self.parent_app._save_settings()
         self.destroy()
 
@@ -1341,6 +1292,12 @@ class GuolingTaskOcr(tk.Tk):
         self.flash_sound_mode_var = tk.StringVar(value=str(settings["flash_sound_mode"]))
         self.flash_wav_path_var = tk.StringVar(value=str(settings["flash_wav_path"]))
         self.flash_cooldown_var = tk.StringVar(value=f"{float(settings['flash_cooldown_seconds']):g}")
+        self.flash_enabled_var = tk.BooleanVar(value=bool(settings["flash_enabled"]))
+        self.flash_events: Queue[FlashEvent] = Queue(maxsize=FLASH_EVENT_QUEUE_SIZE)
+        self.flash_monitor = FlashMonitor(self.flash_events)
+        self.flash_window_handles: dict[str, int] = {}
+        self.flash_last_alert: dict[int, float] = {}
+        self.flash_status_var = tk.StringVar(value="闪烁提醒已关闭")
         self._auto_generation = 0
         self.window_var = tk.StringVar()
         self.capture_method_var = tk.StringVar(value=str(settings["capture_method"]))
@@ -1351,6 +1308,9 @@ class GuolingTaskOcr(tk.Tk):
         self._register_hotkey()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(200, self.refresh_game_windows)
+        self.after(250, self.refresh_flash_windows)
+        self.after(300, self._restore_flash_monitor)
+        self.after(100, self._process_flash_events)
 
     def _style_legacy(self) -> None:
         style = ttk.Style(self)
@@ -1526,7 +1486,13 @@ class GuolingTaskOcr(tk.Tk):
         ttk.Button(settings_tools, text="录制", command=self.record_hotkey).pack(side="left", padx=(6, 0))
         ttk.Button(settings_tools, text="怪物词表", command=self.open_monster_lookup).pack(side="left", padx=(14, 0))
         ttk.Button(settings_tools, text="自定义词库", command=self.open_custom_vocabulary).pack(side="left", padx=(7, 0))
-        ttk.Button(settings_tools, text="闪烁提醒", command=self.open_flash_alert).pack(side="left", padx=(7, 0))
+        ttk.Checkbutton(
+            settings_tools,
+            text="闪烁提醒",
+            variable=self.flash_enabled_var,
+            command=self.toggle_flash_monitor,
+        ).pack(side="left", padx=(14, 0))
+        ttk.Button(settings_tools, text="提醒设置", command=self.open_flash_alert).pack(side="left", padx=(7, 0))
         ttk.Button(settings_tools, text="关于 / 更新", command=self.open_about_dialog).pack(side="left", padx=(7, 0))
 
         recognition_actions = ttk.Frame(tools, style="Toolbar.TFrame")
@@ -1608,6 +1574,7 @@ class GuolingTaskOcr(tk.Tk):
 
     def _close(self) -> None:
         self._save_settings()
+        self.flash_monitor.stop()
         try:
             if self.flash_alert.winfo_exists():
                 self.flash_alert.close()
@@ -1676,6 +1643,65 @@ class GuolingTaskOcr(tk.Tk):
             pass
         self.flash_alert = FlashAlertDialog(self)
 
+    def refresh_flash_windows(self) -> None:
+        previous_title = self._window_title_from_label(self.flash_window_var.get())
+        self.flash_window_handles.clear()
+        for hwnd, title in list_visible_windows():
+            label = f"{title}  [窗口 {hwnd}]"
+            self.flash_window_handles[label] = hwnd
+        restored = next(
+            (label for label in self.flash_window_handles if self._window_title_from_label(label) == previous_title),
+            "",
+        )
+        self.flash_window_var.set(restored)
+
+    def _restore_flash_monitor(self) -> None:
+        if self.flash_enabled_var.get():
+            self.toggle_flash_monitor(save=False)
+
+    def toggle_flash_monitor(self, save: bool = True) -> None:
+        if self.flash_enabled_var.get():
+            if not self.flash_window_handles:
+                self.refresh_flash_windows()
+            try:
+                self.flash_monitor.start()
+            except RuntimeError as error:
+                self.flash_enabled_var.set(False)
+                self.flash_status_var.set(f"闪烁提醒启动失败：{error}")
+            else:
+                self.flash_status_var.set("闪烁提醒：监听中")
+        else:
+            self.flash_monitor.stop()
+            self.flash_status_var.set("闪烁提醒已关闭")
+        if save:
+            self._save_settings()
+
+    def _process_flash_events(self) -> None:
+        for _ in range(FLASH_EVENTS_PER_TICK):
+            try:
+                event = self.flash_events.get_nowait()
+            except Empty:
+                break
+            selected_hwnd = self.flash_window_handles.get(self.flash_window_var.get())
+            if not matches_event(event, self.flash_title_filter_var.get(), selected_hwnd):
+                continue
+            now = time.monotonic()
+            last = self.flash_last_alert.get(event.hwnd)
+            if last is not None and now - last < self._flash_cooldown_seconds():
+                continue
+            self.flash_last_alert[event.hwnd] = now
+            success = play_sound(self.flash_sound_mode_var.get(), self.flash_wav_path_var.get())
+            message = f"{'已提醒' if success else '声音播放失败'}：{event.title}"
+            self.flash_status_var.set(f"闪烁提醒：{message}")
+            self.status_var.set(f"闪烁提醒：{message}")
+            try:
+                if self.flash_alert.winfo_exists():
+                    self.flash_alert._add_report(f"{message}，{event.source}")
+            except AttributeError:
+                pass
+        if self.winfo_exists():
+            self.after(100, self._process_flash_events)
+
     @staticmethod
     def _window_title_from_label(label: str) -> str:
         return label.partition("  [窗口")[0]
@@ -1695,6 +1721,7 @@ class GuolingTaskOcr(tk.Tk):
             "flash_sound_mode": self.flash_sound_mode_var.get(),
             "flash_wav_path": self.flash_wav_path_var.get(),
             "flash_cooldown_seconds": self._flash_cooldown_seconds(),
+            "flash_enabled": self.flash_enabled_var.get(),
         })
 
     def _flash_cooldown_seconds(self) -> float:

@@ -10,11 +10,11 @@ if not exist "%PYTHON%" goto :missing_venv
 "%PYTHON%" -m pip install -r requirements-build.txt
 if errorlevel 1 goto :failed
 
-"%PYTHON%" -m PyInstaller --noconfirm --clean --windowed --onefile --name GuoLingZhuShou-1.3.2 --paths "%PROJECT_DIR%\src" --distpath release --workpath build\pyinstaller --specpath build --add-data "%PROJECT_DIR%\src\guoling_task_ocr\data;guoling_task_ocr\data" --add-data "%PROJECT_DIR%\CHANGELOG.md;." --add-data "%PROJECT_DIR%\.venv\Lib\site-packages\Cython\Utility\CppSupport.cpp;Cython\Utility" --collect-all paddle --collect-all paddleocr --collect-all windows_capture --collect-data Cython "%PROJECT_DIR%\scripts\pyinstaller_entry.py"
+"%PYTHON%" -m PyInstaller --noconfirm --clean --windowed --onefile --name GuoLingZhuShou-1.3.3 --paths "%PROJECT_DIR%\src" --distpath release --workpath build\pyinstaller --specpath build --add-data "%PROJECT_DIR%\src\guoling_task_ocr\data;guoling_task_ocr\data" --add-data "%PROJECT_DIR%\CHANGELOG.md;." --add-data "%PROJECT_DIR%\.venv\Lib\site-packages\Cython\Utility\CppSupport.cpp;Cython\Utility" --collect-all paddle --collect-all paddleocr --collect-all windows_capture --collect-data Cython "%PROJECT_DIR%\scripts\pyinstaller_entry.py"
 if errorlevel 1 goto :failed
 
 echo.
-echo Build completed: release\GuoLingZhuShou-1.3.2.exe
+echo Build completed: release\GuoLingZhuShou-1.3.3.exe
 pause
 exit /b 0
 
