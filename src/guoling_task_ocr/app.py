@@ -107,7 +107,7 @@ ITEM_PATTERNS = (
     r"([\u4e00-\u9fff]{2,8}(?:-\d+级)?)\s*\d+\s*/\s*\d+",
 )
 
-DEFAULT_SETTINGS: dict[str, str | float] = {
+DEFAULT_SETTINGS: dict[str, str | float | bool] = {
     "capture_method": CAPTURE_METHODS[1],
     "interval_seconds": DEFAULT_AUTO_INTERVAL_SECONDS,
     "hotkey": DEFAULT_HOTKEY,
@@ -123,6 +123,7 @@ DEFAULT_SETTINGS: dict[str, str | float] = {
     "market_token": "",
     "market_user_id": "",
     "market_region": "得陇",
+    "market_auto_query": False,
 }
 
 
@@ -196,10 +197,14 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
     flash_enabled = payload.get("flash_enabled")
     if isinstance(flash_enabled, bool):
         settings["flash_enabled"] = flash_enabled
+
+    market_auto_query = payload.get("market_auto_query")
+    if isinstance(market_auto_query, bool):
+        settings["market_auto_query"] = market_auto_query
     return settings
 
 
-def save_user_settings(settings: dict[str, str | float], settings_path: Path = SETTINGS_PATH) -> None:
+def save_user_settings(settings: dict[str, str | float | bool], settings_path: Path = SETTINGS_PATH) -> None:
     """Persist only simple preferences; OCR results and screen captures are not stored."""
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1451,10 +1456,12 @@ class GuolingTaskOcr(tk.Tk):
         )
         self.market_client = MarketClient()
         self.market_item_var = tk.StringVar()
+        self.market_auto_query_var = tk.BooleanVar(value=bool(settings["market_auto_query"]))
         self.market_status_var = tk.StringVar(value="请在“行情设置”中登录后查询摊位和商行信息。")
         self.market_detail_var = tk.StringVar()
         self.market_rows: dict[str, dict[str, str]] = {}
         self.market_busy = False
+        self.market_last_auto_query: tuple[str, str] | None = None
         self.flash_events: Queue[FlashEvent] = Queue(maxsize=FLASH_EVENT_QUEUE_SIZE)
         self.flash_monitor = FlashMonitor(self.flash_events)
         self.flash_window_handles: dict[str, int] = {}
@@ -1584,6 +1591,8 @@ class GuolingTaskOcr(tk.Tk):
         style.configure("MarketNote.TLabel", background="#2f1a15", foreground="#d8bda2", font=(font, 9))
         style.configure("Market.TButton", font=(font, 9, "bold"), padding=(10, 6), foreground="#fff0bc", background="#71402b")
         style.map("Market.TButton", background=[("active", "#8a5134"), ("disabled", "#5c4b43")])
+        style.configure("Market.TCheckbutton", background="#2f1a15", foreground="#f7d9a5", font=(font, 9))
+        style.map("Market.TCheckbutton", background=[("active", "#2f1a15")])
         style.configure("Market.Treeview", background="#3e2119", fieldbackground="#3e2119", foreground="#fff2d1", rowheight=29, font=(font, 9), borderwidth=0)
         style.map("Market.Treeview", background=[("selected", "#765039")], foreground=[("selected", "#fff7d6")])
         style.configure("Market.Treeview.Heading", background="#5a2d1c", foreground="#ffe16d", font=(font, 9, "bold"), relief="flat", padding=(8, 6))
@@ -1611,8 +1620,9 @@ class GuolingTaskOcr(tk.Tk):
         ttk.Label(source, text="游戏窗口", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.window_combo = ttk.Combobox(source, textvariable=self.window_var, state="readonly", width=46)
         self.window_combo.grid(row=0, column=1, sticky="ew")
-        ttk.Button(source, text="刷新", command=self.refresh_game_windows).grid(row=0, column=2, padx=(8, 14))
-        ttk.Label(source, text="截图方式", style="Field.TLabel").grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(source, text="刷新", command=self.refresh_game_windows).grid(row=0, column=2, padx=(8, 8))
+        ttk.Button(source, text="截取窗口", command=self.capture_selected_window, style="Primary.TButton").grid(row=0, column=3, padx=(4, 0))
+        ttk.Label(source, text="截图方式", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
         self.capture_method_combo = ttk.Combobox(
             source,
             textvariable=self.capture_method_var,
@@ -1620,10 +1630,9 @@ class GuolingTaskOcr(tk.Tk):
             state="readonly",
             width=17,
         )
-        self.capture_method_combo.grid(row=0, column=4, sticky="w")
+        self.capture_method_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
         self.capture_method_combo.bind("<<ComboboxSelected>>", self._save_settings)
         self.window_combo.bind("<<ComboboxSelected>>", self._save_settings)
-        ttk.Button(source, text="截取窗口", command=self.capture_selected_window, style="Primary.TButton").grid(row=0, column=5, padx=(12, 0))
 
         tools = ttk.Frame(root, style="Surface.TFrame", padding=(14, 9))
         tools.grid(row=2, column=0, sticky="ew", pady=(0, 12))
@@ -1631,9 +1640,9 @@ class GuolingTaskOcr(tk.Tk):
 
         capture_tools = ttk.Frame(tools, style="Toolbar.TFrame")
         capture_tools.grid(row=0, column=0, sticky="w")
-        ttk.Button(capture_tools, text="框选屏幕", command=self.capture_and_select).pack(side="left")
-        ttk.Button(capture_tools, text="载入截图", command=self.load_image).pack(side="left", padx=(7, 0))
-        ttk.Button(capture_tools, text="默认区域", command=self.default_crop).pack(side="left", padx=(7, 0))
+        ttk.Button(capture_tools, text="框选屏幕", command=self.capture_and_select, width=10).pack(side="left")
+        ttk.Button(capture_tools, text="载入截图", command=self.load_image, width=10).pack(side="left", padx=(7, 0))
+        ttk.Button(capture_tools, text="默认区域", command=self.default_crop, width=10).pack(side="left", padx=(7, 0))
 
         auto_tools = ttk.Frame(tools, style="Toolbar.TFrame")
         auto_tools.grid(row=0, column=1, sticky="e")
@@ -1753,14 +1762,26 @@ class GuolingTaskOcr(tk.Tk):
             width=8,
         )
         market_region.grid(row=0, column=1, sticky="w")
-        market_region.bind("<<ComboboxSelected>>", self._save_settings)
+        market_region.bind("<<ComboboxSelected>>", self._on_market_region_selected)
         ttk.Label(market_controls, text="物品名", style="MarketField.TLabel").grid(row=0, column=2, sticky="e", padx=(14, 7))
         self.market_item_entry = ttk.Entry(market_controls, textvariable=self.market_item_var, style="Result.TEntry")
         self.market_item_entry.grid(row=0, column=3, sticky="ew")
+        self.market_item_entry.bind("<Return>", self._on_market_query_enter)
         self.market_query_button = ttk.Button(market_controls, text="查询行情", command=self.query_market, style="Market.TButton")
         self.market_query_button.grid(row=0, column=4, padx=(9, 0))
-        ttk.Button(market_controls, text="使用 OCR 物品", command=self.use_ocr_item_for_market, style="Market.TButton").grid(row=0, column=5, padx=(7, 0))
-        ttk.Button(market_controls, text="打开原网站", command=lambda: webbrowser.open(MARKET_WEB_URL), style="Market.TButton").grid(row=0, column=6, padx=(7, 0))
+        ttk.Checkbutton(
+            market_controls,
+            text="OCR 后自动查询",
+            variable=self.market_auto_query_var,
+            command=self._on_market_auto_query_toggled,
+            style="Market.TCheckbutton",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Button(market_controls, text="使用 OCR 物品", command=self.use_ocr_item_for_market, style="Market.TButton").grid(
+            row=1, column=3, sticky="e", pady=(7, 0)
+        )
+        ttk.Button(market_controls, text="打开原网站", command=lambda: webbrowser.open(MARKET_WEB_URL), style="Market.TButton").grid(
+            row=1, column=4, padx=(7, 0), pady=(7, 0)
+        )
 
         market_table_holder = ttk.Frame(market, style="Market.TFrame")
         market_table_holder.grid(row=2, column=0, sticky="nsew")
@@ -1888,35 +1909,63 @@ class GuolingTaskOcr(tk.Tk):
             return
         self.market_item_var.set(item)
         self.market_item_entry.focus_set()
+        if self._auto_query_market_item(item):
+            return
         self.market_status_var.set(f"已带入 OCR 物品“{item}”。")
 
-    def query_market(self) -> None:
+    def _on_market_query_enter(self, _event: tk.Event) -> str:
+        self.query_market()
+        return "break"
+
+    def _on_market_region_selected(self, _event: tk.Event) -> None:
+        self.market_last_auto_query = None
+        self._save_settings()
+
+    def _on_market_auto_query_toggled(self) -> None:
+        self.market_last_auto_query = None
+        self._save_settings()
+        state = "已开启" if self.market_auto_query_var.get() else "已关闭"
+        self.market_status_var.set(f"OCR 后自动查询{state}。")
+
+    def _auto_query_market_item(self, item: str) -> bool:
+        if not self.market_auto_query_var.get():
+            return False
+        query_key = (self.market_region_var.get().strip(), item)
+        if not item or query_key == self.market_last_auto_query:
+            return False
+        if self.query_market():
+            self.market_last_auto_query = query_key
+            return True
+        return False
+
+    def query_market(self) -> bool:
         session = self.market_session
         keyword = self.market_item_var.get().strip()
         region = self.market_region_var.get().strip()
         if self.market_busy:
-            return
+            return False
         if session is None:
             self.market_status_var.set("请先打开“行情设置”登录账号。")
-            return
+            return False
         if not keyword:
             self.market_status_var.set("请输入物品名，或使用当前 OCR 结果。")
             self.market_item_entry.focus_set()
-            return
+            return False
         if not region:
             self.market_status_var.set("请在“行情设置”中选择区服。")
-            return
+            return False
         self._set_market_busy(True, f"正在查询“{keyword}”的摊位和商行行情...")
 
         def worker() -> None:
             try:
                 rows = flatten_listings(self.market_client.query_listings(session, region, keyword))
             except MarketQueryError as error:
-                self.after(0, self._market_query_done, [], str(error))
+                self.after(0, self._market_query_done, [], str(error), keyword)
             else:
-                self.after(0, self._market_query_done, rows, "")
+                self.after(0, self._market_query_done, rows, "", keyword)
 
         threading.Thread(target=worker, name="market-query", daemon=True).start()
+        return True
 
     def _set_market_busy(self, busy: bool, message: str | None = None) -> None:
         self.market_busy = busy
@@ -1924,7 +1973,7 @@ class GuolingTaskOcr(tk.Tk):
         if message:
             self.market_status_var.set(message)
 
-    def _market_query_done(self, rows: list[dict[str, str]], error: str) -> None:
+    def _market_query_done(self, rows: list[dict[str, str]], error: str, keyword: str) -> None:
         if not self.winfo_exists():
             return
         self._set_market_busy(False)
@@ -1946,7 +1995,7 @@ class GuolingTaskOcr(tk.Tk):
                 values=(row["source"], item_quantity, row["owner"], row["stall_info"], row["coordinate"], row["price"]),
                 tags=("even" if index % 2 == 0 else "odd",),
             )
-        self.market_status_var.set(f"找到 {len(rows)} 条“{self.market_item_var.get().strip()}”行情记录。")
+        self.market_status_var.set(f"找到 {len(rows)} 条“{keyword}”行情记录。")
 
     def _show_market_detail(self, _event: tk.Event) -> None:
         selected = self.market_table.selection()
@@ -2066,6 +2115,7 @@ class GuolingTaskOcr(tk.Tk):
             "market_token": self.market_session.token if self.market_session else "",
             "market_user_id": self.market_session.user_id if self.market_session else "",
             "market_region": self.market_region_var.get(),
+            "market_auto_query": self.market_auto_query_var.get(),
         })
 
     def _flash_cooldown_seconds(self) -> float:
@@ -2482,7 +2532,10 @@ class GuolingTaskOcr(tk.Tk):
             self.market_item_var.set(candidate)
             self.last_valid_item = candidate
             self.copy_item(silent=True)
-            self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板。")
+            if self._auto_query_market_item(candidate):
+                self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板，正在自动查询行情。")
+            else:
+                self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板。")
         else:
             if self.last_valid_item:
                 self.item_var.set(self.last_valid_item)

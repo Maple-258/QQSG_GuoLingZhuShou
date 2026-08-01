@@ -43,6 +43,7 @@ class PreferencesTests(unittest.TestCase):
                     "market_token": "market-token",
                     "market_user_id": "12345",
                     "market_region": "得陇",
+                    "market_auto_query": True,
                 },
                 settings_path,
             )
@@ -64,6 +65,7 @@ class PreferencesTests(unittest.TestCase):
                     "market_token": "market-token",
                     "market_user_id": "12345",
                     "market_region": "得陇",
+                    "market_auto_query": True,
                 },
             )
 
