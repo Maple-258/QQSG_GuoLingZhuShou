@@ -475,12 +475,15 @@ def _record_round_index(
         record.current_step for record in existing
         if record.round_index == latest_round
     }
+    latest_step = max(latest_steps, default=0)
+    completed_round = bool(round_size) and set(range(1, round_size + 1)).issubset(latest_steps)
+    if completed_round and parsed.current_step < latest_step:
+        return latest_round + 1
     if parsed.current_step == 1:
         # A task panel never returns to step 1 within the same run.  Therefore
         # seeing step 1 after any later observed step is a new round even when
         # OCR was not active for every intermediate step.
         has_later_step = any(step > 1 for step in latest_steps)
-        completed_round = round_size and set(range(1, round_size + 1)).issubset(latest_steps)
         if has_later_step or completed_round:
             return latest_round + 1
     return latest_round

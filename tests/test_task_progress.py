@@ -222,6 +222,18 @@ class TaskProgressTests(unittest.TestCase):
         self.assertEqual(new_round.round_index, 2)
         self.assertEqual(len(records), 4)
 
+    def test_starts_a_new_round_when_the_first_observed_step_is_two(self) -> None:
+        records = {}
+        objective = TaskObjective("item", "人阶强化灵宝", 0, 4)
+        for step in range(1, 9):
+            record_task_progress(records, "小乔", ParsedTaskProgress("高级国令慕贤", step, 8), objective)
+
+        second_round = record_task_progress(
+            records, "小乔", ParsedTaskProgress("高级国令慕贤", 2, 8), objective
+        )
+        self.assertEqual(second_round.round_index, 2)
+        self.assertEqual(len(records), 9)
+
     def test_repeated_first_step_does_not_start_a_new_round(self) -> None:
         records = {}
         objective = TaskObjective("item", "灵魄成长石", 0, 1)
