@@ -1,6 +1,7 @@
 paddleocr>=2.7,<3.0
 paddlepaddle==2.6.2
 Pillow>=10.0
+requests>=2.31
 keyboard>=0.13.5
 pywin32>=306
 windows-capture==2.0.0

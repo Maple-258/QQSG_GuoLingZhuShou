@@ -16,6 +16,7 @@ import ctypes
 import webbrowser
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from ctypes import wintypes
 from functools import lru_cache
 from pathlib import Path
@@ -23,8 +24,26 @@ from queue import Empty, Queue
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
+from .cloud_ocr import CloudOcrClient, CloudOcrError, DEFAULT_MODEL as DEFAULT_CLOUD_OCR_MODEL
 from .flash_alert import FlashEvent, FlashMonitor, list_visible_windows, matches_event, play_sound
 from .market_query import MARKET_WEB_URL, MarketClient, MarketQueryError, MarketSession, flatten_listings
+from .task_progress import (
+    TaskObjective,
+    TaskProgress,
+    ParsedTaskProgress,
+    find_task_name,
+    find_role_name,
+    filter_task_progress_records,
+    infer_unread_task_step,
+    is_role_name_candidate,
+    load_task_progress,
+    parse_task_objective,
+    parse_task_progress,
+    record_task_progress,
+    save_task_progress,
+    summarize_task_rounds,
+    task_record_key,
+)
 
 from PIL import Image, ImageEnhance, ImageGrab, ImageOps, ImageTk
 
@@ -75,9 +94,11 @@ APP_DATA_DIR = _persistent_data_dir()
 SETTINGS_PATH = APP_DATA_DIR / "settings.json"
 OCR_MODEL_DIR = APP_DATA_DIR / "ocr_models"
 LOG_PATH = APP_DATA_DIR / "ocr_app.log"
+TASK_PROGRESS_PATH = APP_DATA_DIR / "task_progress.json"
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 TASK_CROP = (0.80, 0.41, 0.985, 0.54)
+CLOUD_TASK_CROP = (0.785, 0.385, 0.993, 0.55)
 DEFAULT_HOTKEY = "ctrl+alt+g"
 DEFAULT_AUTO_INTERVAL_SECONDS = 2.0
 MIN_AUTO_INTERVAL_SECONDS = 0.5
@@ -90,12 +111,22 @@ FLASH_EVENTS_PER_TICK = 32
 CAPTURE_METHODS = ("WGC（后台，高效）", "PrintWindow（兼容）")
 TASK_OCR_SCALE = 4
 TASK_OCR_MAX_PIXELS = 4_000_000
+CLOUD_TASK_OCR_SCALE = 2
+CLOUD_TASK_OCR_MAX_PIXELS = 1_000_000
+# QQ SG places the player-name HUD at a stable location inside its client area.
+# Ratios keep the crop aligned on windowed, 720p, and higher-resolution clients.
+PLAYER_NAME_REGION = (0.015, 0.015, 0.30, 0.18)
+PLAYER_OCR_SCALE = 3
+PLAYER_OCR_MAX_PIXELS = 1_500_000
 UNCHANGED_FRAME_THRESHOLD = 2.0
 WGC_CAPTURE_TIMEOUT_SECONDS = 3.0
 TASK_CONTEXT_TERMS = ("任务", "国令", "NPC", "需要", "收集", "提交", "消灭")
+MONSTER_OBJECTIVE_TERMS = ("消灭", "灭怪物", "击败", "击杀", "打败", "剿灭", "杀死")
 ITEM_ALIASES_PATH = DATA_DIR / "道具OCR纠错.json"
+ROLE_ALIASES_PATH = DATA_DIR / "角色OCR纠错.json"
 ITEM_VOCABULARY_PATH = DATA_DIR / "官方道具词表.json"
 MONSTER_VOCABULARY_PATH = DATA_DIR / "官方怪物词表.json"
+NPC_VOCABULARY_PATH = DATA_DIR / "官方NPC词表.json"
 CUSTOM_ITEM_VOCABULARY_PATH = APP_DATA_DIR / "custom_item_vocabulary.json"
 EXCLUDED_WORDS = {
     "任务追踪", "国令慕贤", "高级国令", "当前", "任务", "目标", "进度", "完成",
@@ -107,7 +138,7 @@ ITEM_PATTERNS = (
     r"([\u4e00-\u9fff]{2,8}(?:-\d+级)?)\s*\d+\s*/\s*\d+",
 )
 
-DEFAULT_SETTINGS: dict[str, str | float | bool] = {
+DEFAULT_SETTINGS: dict[str, str | float | bool | dict[str, str]] = {
     "capture_method": CAPTURE_METHODS[1],
     "interval_seconds": DEFAULT_AUTO_INTERVAL_SECONDS,
     "hotkey": DEFAULT_HOTKEY,
@@ -124,6 +155,13 @@ DEFAULT_SETTINGS: dict[str, str | float | bool] = {
     "market_user_id": "",
     "market_region": "得陇",
     "market_auto_query": False,
+    "ocr_mode": "local",
+    "cloud_ocr_token": "",
+    "cloud_ocr_model": DEFAULT_CLOUD_OCR_MODEL,
+    "cloud_ocr_api_url": "",
+    "task_tracker_role": "",
+    "window_role_bindings": {},
+    "show_changelog_on_start": True,
 }
 
 
@@ -131,6 +169,13 @@ def task_ocr_target_size(image_size: tuple[int, int]) -> tuple[int, int]:
     """Preserve the normal 4x OCR scale without allowing oversized task crops."""
     width, height = image_size
     scale = min(TASK_OCR_SCALE, math.sqrt(TASK_OCR_MAX_PIXELS / (width * height)))
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def cloud_task_ocr_target_size(image_size: tuple[int, int]) -> tuple[int, int]:
+    """Keep cloud uploads clear without sending the local four-times enlargement."""
+    width, height = image_size
+    scale = min(CLOUD_TASK_OCR_SCALE, math.sqrt(CLOUD_TASK_OCR_MAX_PIXELS / (width * height)))
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
@@ -143,7 +188,7 @@ def should_skip_unchanged_task(
     return difference < UNCHANGED_FRAME_THRESHOLD
 
 
-def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | float]:
+def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | float | bool | dict[str, str]]:
     """Load validated user preferences without letting a bad file prevent startup."""
     settings = DEFAULT_SETTINGS.copy()
     try:
@@ -172,10 +217,17 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
     if isinstance(window_title, str):
         settings["window_title"] = window_title
 
-    for key in ("flash_title_filter", "flash_window_title", "flash_wav_path", "market_account", "market_token", "market_user_id", "market_region"):
+    for key in (
+        "flash_title_filter", "flash_window_title", "flash_wav_path", "market_account", "market_token", "market_user_id",
+        "market_region", "task_tracker_role", "cloud_ocr_token", "cloud_ocr_model", "cloud_ocr_api_url",
+    ):
         value = payload.get(key)
         if isinstance(value, str):
             settings[key] = value
+
+    ocr_mode = payload.get("ocr_mode")
+    if ocr_mode in {"local", "cloud"}:
+        settings["ocr_mode"] = ocr_mode
 
     target_mode = payload.get("flash_target_mode")
     if target_mode in {"window", "keyword"}:
@@ -201,10 +253,25 @@ def load_user_settings(settings_path: Path = SETTINGS_PATH) -> dict[str, str | f
     market_auto_query = payload.get("market_auto_query")
     if isinstance(market_auto_query, bool):
         settings["market_auto_query"] = market_auto_query
+
+    show_changelog_on_start = payload.get("show_changelog_on_start")
+    if isinstance(show_changelog_on_start, bool):
+        settings["show_changelog_on_start"] = show_changelog_on_start
+
+    window_role_bindings = payload.get("window_role_bindings")
+    if isinstance(window_role_bindings, dict):
+        settings["window_role_bindings"] = {
+            title.strip(): role.strip()
+            for title, role in window_role_bindings.items()
+            if isinstance(title, str) and isinstance(role, str)
+            and title.strip() and is_role_name_candidate(role.strip())
+        }
     return settings
 
 
-def save_user_settings(settings: dict[str, str | float | bool], settings_path: Path = SETTINGS_PATH) -> None:
+def save_user_settings(
+    settings: dict[str, str | float | bool | dict[str, str]], settings_path: Path = SETTINGS_PATH,
+) -> None:
     """Persist only simple preferences; OCR results and screen captures are not stored."""
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,6 +286,23 @@ def load_changelog(changelog_path: Path = CHANGELOG_PATH) -> str:
         return changelog_path.read_text(encoding="utf-8-sig")
     except OSError:
         return "未找到本地更新日志。请前往 GitHub Releases 查看版本记录。"
+
+
+def render_changelog(markdown: str) -> str:
+    """Render the bundled Markdown changelog as clean, readable plain text."""
+    rendered: list[str] = []
+    for raw_line in markdown.splitlines():
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", raw_line).replace("**", "").replace("`", "")
+        if match := re.match(r"^#{1,3}\s+(.*)$", line):
+            title = match.group(1).strip()
+            rendered.append(title)
+            if raw_line.startswith("## "):
+                rendered.append("─" * min(48, max(12, len(title) * 2)))
+        elif match := re.match(r"^\s*[-*+]\s+(.*)$", line):
+            rendered.append(f"• {match.group(1).strip()}")
+        else:
+            rendered.append(line)
+    return "\n".join(rendered).strip()
 
 
 def parse_version(version: str) -> tuple[int, int, int] | None:
@@ -394,6 +478,24 @@ def load_item_aliases() -> dict[str, str]:
 
 
 @lru_cache(maxsize=1)
+def load_role_aliases() -> dict[str, str]:
+    """Load user-confirmed OCR corrections for character names."""
+    try:
+        data = json.loads(ROLE_ALIASES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {str(source): str(target) for source, target in data.items() if source and target}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def correct_role_name(candidate: str) -> str:
+    """Apply explicit character-name corrections without guessing a new role."""
+    normalized = re.sub(r"\s+", "", candidate)
+    return load_role_aliases().get(normalized, normalized)
+
+
+@lru_cache(maxsize=1)
 def load_official_item_names() -> frozenset[str]:
     """读取随程序保存的 QQ 三国官网物品词表。"""
     try:
@@ -459,6 +561,40 @@ def load_all_item_names() -> frozenset[str]:
     return load_official_item_names() | custom_names
 
 
+def normalize_market_keyword(value: str) -> str:
+    """Use half-width parentheses for all third-party market searches."""
+    return value.strip().translate(str.maketrans({"（": "(", "）": ")"}))
+
+
+def learn_market_item_name(
+    keyword: str,
+    rows: list[dict[str, str]],
+    vocabulary_path: Path = CUSTOM_ITEM_VOCABULARY_PATH,
+) -> str:
+    """Save one unambiguous third-party market result for future OCR matching."""
+    normalized_keyword = re.sub(r"\s+", "", normalize_market_keyword(keyword))
+    names = {
+        re.sub(r"\s+", "", normalize_market_keyword(str(row.get("name", ""))))
+        for row in rows
+        if str(row.get("name", "")).strip() not in {"", "-"}
+    }
+    if not normalized_keyword or len(names) != 1:
+        return ""
+    discovered_name = names.pop()
+    custom_names, aliases = load_custom_item_vocabulary(vocabulary_path)
+    existing_alias = aliases.get(normalized_keyword)
+    if existing_alias and existing_alias != discovered_name:
+        return ""
+    if discovered_name in custom_names and (normalized_keyword == discovered_name or existing_alias == discovered_name):
+        return discovered_name
+    updated_names = set(custom_names)
+    updated_names.add(discovered_name)
+    if normalized_keyword != discovered_name:
+        aliases[normalized_keyword] = discovered_name
+    save_custom_item_vocabulary(updated_names, aliases, vocabulary_path)
+    return discovered_name
+
+
 @lru_cache(maxsize=1)
 def load_official_monsters() -> tuple[dict[str, str], ...]:
     """读取随程序发布的官网怪物资料，用于离线查询。"""
@@ -479,6 +615,33 @@ def load_official_monsters() -> tuple[dict[str, str], ...]:
         )
     except (OSError, ValueError, TypeError):
         return ()
+
+
+@lru_cache(maxsize=1)
+def load_official_npcs() -> tuple[dict[str, str], ...]:
+    """Load the bundled official NPC directory for OCR correction."""
+    try:
+        data = json.loads(NPC_VOCABULARY_PATH.read_text(encoding="utf-8-sig"))
+        npcs = data.get("npcs", [])
+        if not isinstance(npcs, list):
+            return ()
+        return tuple(
+            {
+                "name": str(npc.get("name", "")).strip(),
+                "location": str(npc.get("location", "")).strip(),
+                "x": str(npc.get("x", "")).strip(),
+                "y": str(npc.get("y", "")).strip(),
+            }
+            for npc in npcs
+            if isinstance(npc, dict) and str(npc.get("name", "")).strip()
+        )
+    except (OSError, ValueError, TypeError):
+        return ()
+
+
+@lru_cache(maxsize=1)
+def load_official_npc_names() -> frozenset[str]:
+    return frozenset(npc["name"] for npc in load_official_npcs())
 
 
 def search_official_monsters(
@@ -510,6 +673,26 @@ def search_official_monsters(
     return tuple(monster for _fields, monster in matched)
 
 
+def is_monster_task_target(lines: list[str], candidate: str = "", target_kind: str = "") -> bool:
+    """Identify monster objectives while respecting an already parsed item target."""
+    if target_kind == "item":
+        return False
+    if target_kind == "monster":
+        return True
+    text = _normalise_ocr_text("".join(lines))
+    if not any(term in text for term in MONSTER_OBJECTIVE_TERMS):
+        return False
+    if "怪物" in text:
+        return True
+    normalized_candidate = re.sub(r"\s+", "", candidate).casefold()
+    if not normalized_candidate:
+        return False
+    return any(
+        normalized_candidate == re.sub(r"\s+", "", monster["name"]).casefold()
+        for monster in load_official_monsters()
+    )
+
+
 def _edit_distance(left: str, right: str) -> int:
     """小词表中使用的字符编辑距离，避免引入额外运行时依赖。"""
     if len(left) < len(right):
@@ -527,27 +710,50 @@ def _edit_distance(left: str, right: str) -> int:
     return previous[-1]
 
 
+def _match_unique_one_character_correction(candidate: str, names: frozenset[str]) -> str:
+    if candidate in names or len(candidate) < 2:
+        return candidate
+    closest_names = [name for name in names if len(name) == len(candidate) and _edit_distance(name, candidate) == 1]
+    return closest_names[0] if len(closest_names) == 1 else candidate
+
+
+def correct_npc_name(candidate: str) -> str:
+    """Correct a single OCR character only when the official NPC name is unique."""
+    normalized = re.sub(r"\s+", "", candidate)
+    return _match_unique_one_character_correction(normalized, load_official_npc_names())
+
+
+ITEM_GRADE_PATTERN = re.compile(r"^(下品|中品|上品|极品|初级|中级|高级|特级|[一二三四五六七八九]阶)")
+
+
+def _item_grade_prefix(name: str) -> str:
+    match = ITEM_GRADE_PATTERN.match(name)
+    return match.group(1) if match else ""
+
+
 def match_official_item_name(candidate: str) -> str:
-    """Only accept a unique nearest official or custom vocabulary match."""
+    """Correct an OCR item name only when one vocabulary result is clearly closest."""
+    candidate = normalize_market_keyword(candidate)
     names = load_all_item_names()
     if candidate in names or len(candidate) < 3:
         return candidate
 
-    # A single-character OCR error can occur at the first character as well.
-    # Accept it only when the nearest same-length vocabulary item is unique.
-    closest_distance = 2
-    closest_names: list[str] = []
-    for name in names:
-        if len(name) != len(candidate):
-            continue
-        distance = _edit_distance(name, candidate)
-        if distance < closest_distance:
-            closest_distance = distance
-            closest_names = [name]
-        elif distance == closest_distance:
-            closest_names.append(name)
-
-    return closest_names[0] if closest_distance == 1 and len(closest_names) == 1 else candidate
+    # Item OCR may lose or misread two characters in longer names.  Keep the
+    # correction bounded and unique, and never cross a quality/tier prefix.
+    candidate_grade = _item_grade_prefix(candidate)
+    maximum_distance = 1 if len(candidate) <= 5 else 2
+    matches = [
+        (_edit_distance(name, candidate), name)
+        for name in names
+        if abs(len(name) - len(candidate)) <= maximum_distance
+        and (not candidate_grade or _item_grade_prefix(name) == candidate_grade)
+    ]
+    matches = [(distance, name) for distance, name in matches if distance <= maximum_distance]
+    if not matches:
+        return candidate
+    closest_distance = min(distance for distance, _name in matches)
+    closest_names = [name for distance, name in matches if distance == closest_distance]
+    return closest_names[0] if len(closest_names) == 1 else candidate
 
 
 def correct_item_name(candidate: str) -> str:
@@ -560,7 +766,7 @@ def correct_item_name(candidate: str) -> str:
             if suffix != candidate and re.fullmatch(r"-\d+级", suffix):
                 corrected = expected + suffix
                 break
-    return match_official_item_name(corrected)
+    return match_official_item_name(normalize_market_keyword(corrected))
 
 
 def _entry_box(entry: tuple[list[list[float]], str]) -> tuple[float, float, float, float]:
@@ -568,6 +774,69 @@ def _entry_box(entry: tuple[list[list[float]], str]) -> tuple[float, float, floa
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+HUD_LEVEL_ONLY_PATTERN = re.compile(r"\s*[Ll1IiSs5][vVyY]?\s*\d{1,4}\s*$")
+HUD_LEVEL_AND_NAME_PATTERN = re.compile(r"\s*[Ll1IiSs5][vVyY]?\s*\d{1,4}\s+(.+?)\s*$")
+
+
+def find_hud_role_name(
+    entries: list[tuple[list[list[float]], str]], allow_isolated_name: bool = False,
+) -> str | None:
+    """Prefer the name positioned beside the level in QQ SG's player HUD."""
+    level_boxes: list[tuple[float, float, float, float]] = []
+    candidates: list[tuple[tuple[float, float, float, float], str]] = []
+    for entry in entries:
+        box = _entry_box(entry)
+        text = entry[1].strip()
+        combined = HUD_LEVEL_AND_NAME_PATTERN.fullmatch(text)
+        if combined:
+            role = re.sub(r"\s+", "", combined.group(1))
+            if is_role_name_candidate(role):
+                return role
+        if HUD_LEVEL_ONLY_PATTERN.fullmatch(text):
+            level_boxes.append(box)
+        role = re.sub(r"\s+", "", text)
+        if is_role_name_candidate(role):
+            candidates.append((box, role))
+
+    nearby: list[tuple[float, str]] = []
+    for role_box, role in candidates:
+        left, top, _right, bottom = role_box
+        center_y = (top + bottom) / 2
+        for level_left, level_top, level_right, level_bottom in level_boxes:
+            level_center_y = (level_top + level_bottom) / 2
+            level_height = max(1, level_bottom - level_top)
+            if left >= level_right - level_height and abs(center_y - level_center_y) <= level_height * 1.2:
+                nearby.append((left - level_right, role))
+    if nearby:
+        return min(nearby, key=lambda item: item[0])[1]
+
+    # Only use an isolated word after a dedicated crop around the level/name.
+    # On the full HUD this fallback can mistake unrelated interface text for a role.
+    if allow_isolated_name and candidates:
+        return min(candidates, key=lambda item: (item[0][1], item[0][0]))[1]
+    return None
+
+
+def crop_player_name_from_level(
+    image: Image.Image, entries: list[tuple[list[list[float]], str]]
+) -> Image.Image | None:
+    """Focus OCR on the text immediately to the right of a detected HUD level."""
+    for entry in entries:
+        if not HUD_LEVEL_ONLY_PATTERN.fullmatch(entry[1].strip()):
+            continue
+        left, top, right, bottom = _entry_box(entry)
+        height = max(1, bottom - top)
+        crop_box = (
+            max(0, int(right - height * 0.4)),
+            max(0, int(top - height * 1.1)),
+            min(image.width, int(right + max(220, height * 14))),
+            min(image.height, int(bottom + height * 1.6)),
+        )
+        if crop_box[2] - crop_box[0] >= 20 and crop_box[3] - crop_box[1] >= 20:
+            return image.crop(crop_box)
+    return None
 
 
 def _normalise_ocr_text(text: str) -> str:
@@ -578,6 +847,80 @@ def default_task_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
     width, height = image.size
     left, top, right, bottom = TASK_CROP
     return int(width * left), int(height * top), int(width * right), int(height * bottom)
+
+
+def cloud_task_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
+    """Include the complete right-side task card for a one-request cloud pass."""
+    width, height = image.size
+    left, top, right, bottom = CLOUD_TASK_CROP
+    return int(width * left), int(height * top), int(width * right), int(height * bottom)
+
+
+def player_info_crop_box(
+    image: Image.Image, client_box: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    """Return the upper-left HUD area inside the game client, not its title bar."""
+    width, height = image.size
+    if client_box is None:
+        client_box = (0, 0, width, height)
+    client_left, client_top, client_right, client_bottom = client_box
+    region_left, region_top, region_right, region_bottom = PLAYER_NAME_REGION
+    client_width = client_right - client_left
+    client_height = client_bottom - client_top
+    return (
+        max(0, client_left + round(client_width * region_left)),
+        max(0, client_top + round(client_height * region_top)),
+        min(width, client_left + round(client_width * region_right)),
+        min(height, client_top + round(client_height * region_bottom)),
+    )
+
+
+def game_client_box(hwnd: int | None, image: Image.Image) -> tuple[int, int, int, int]:
+    """Map the Win32 client area onto a captured window image when it has a frame."""
+    width, height = image.size
+    whole_image = (0, 0, width, height)
+    if hwnd is None or sys.platform != "win32":
+        return whole_image
+    try:
+        window_rect = wintypes.RECT()
+        client_rect = wintypes.RECT()
+        client_origin = wintypes.POINT(0, 0)
+        user32 = ctypes.windll.user32
+        if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+            return whole_image
+        if not user32.GetClientRect(hwnd, ctypes.byref(client_rect)):
+            return whole_image
+        if not user32.ClientToScreen(hwnd, ctypes.byref(client_origin)):
+            return whole_image
+        window_width = window_rect.right - window_rect.left
+        window_height = window_rect.bottom - window_rect.top
+        client_width = client_rect.right - client_rect.left
+        client_height = client_rect.bottom - client_rect.top
+        if min(window_width, window_height, client_width, client_height) <= 0:
+            return whole_image
+
+        # Windows Graphics Capture may already return client pixels only.
+        if abs(width - client_width) <= 3 and abs(height - client_height) <= 3:
+            return whole_image
+
+        scale_x = width / window_width
+        scale_y = height / window_height
+        left = round((client_origin.x - window_rect.left) * scale_x)
+        top = round((client_origin.y - window_rect.top) * scale_y)
+        right = left + round(client_width * scale_x)
+        bottom = top + round(client_height * scale_y)
+        if left < 0 or top < 0 or right > width or bottom > height or right <= left or bottom <= top:
+            return whole_image
+        return left, top, right, bottom
+    except (AttributeError, OSError):
+        return whole_image
+
+
+def player_ocr_target_size(image_size: tuple[int, int]) -> tuple[int, int]:
+    """Enlarge the compact player HUD without a costly full-window OCR pass."""
+    width, height = image_size
+    scale = min(PLAYER_OCR_SCALE, math.sqrt(PLAYER_OCR_MAX_PIXELS / (width * height)))
+    return max(1, round(width * scale)), max(1, round(height * scale))
 
 
 def has_task_panel_context(lines: list[str]) -> bool:
@@ -1019,11 +1362,202 @@ class CustomVocabularyDialog(tk.Toplevel):
             self.table.selection_remove(item_id)
 
 
+class TaskProgressDialog(tk.Toplevel):
+    """Show locally saved multi-step task progress for each game role."""
+
+    def __init__(self, parent: "GuolingTaskOcr") -> None:
+        super().__init__(parent)
+        self.parent_app = parent
+        self.title("任务步数追踪")
+        self.geometry("1080x530")
+        self.minsize(880, 430)
+        self.transient(parent)
+        self.row_keys: dict[str, tuple[str, str, int, int]] = {}
+        self.task_filter_var = tk.StringVar(value="全部")
+        self.round_filter_var = tk.StringVar(value="全部")
+        self.date_filter_var = tk.StringVar(value="全部")
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        controls = ttk.Frame(body, style="Surface.TFrame", padding=10)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+        controls.columnconfigure(5, weight=1)
+        ttk.Label(controls, text="当前角色", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        role_entry = ttk.Entry(controls, textvariable=parent.task_role_var)
+        role_entry.grid(row=0, column=1, sticky="ew")
+        role_entry.bind("<FocusOut>", self._save_role)
+        role_entry.bind("<Return>", self._save_role)
+        ttk.Button(controls, text="使用当前 OCR", command=self._record_current_ocr).grid(row=0, column=2, padx=(8, 0))
+        self.round_summary_var = tk.StringVar()
+        ttk.Label(controls, text="各轮成本", style="Field.TLabel").grid(row=1, column=0, sticky="nw", pady=(8, 0), padx=(0, 8))
+        ttk.Label(controls, textvariable=self.round_summary_var, style="Note.TLabel", justify="left", wraplength=940).grid(
+            row=1, column=1, columnspan=6, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(controls, text="任务类型", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(10, 0), padx=(0, 8))
+        self.task_filter_combo = ttk.Combobox(controls, textvariable=self.task_filter_var, state="readonly")
+        self.task_filter_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0))
+        ttk.Label(controls, text="轮次", style="Field.TLabel").grid(row=2, column=2, sticky="w", pady=(10, 0), padx=(14, 8))
+        self.round_filter_combo = ttk.Combobox(controls, textvariable=self.round_filter_var, state="readonly", width=10)
+        self.round_filter_combo.grid(row=2, column=3, sticky="ew", pady=(10, 0))
+        ttk.Label(controls, text="日期", style="Field.TLabel").grid(row=2, column=4, sticky="w", pady=(10, 0), padx=(14, 8))
+        self.date_filter_combo = ttk.Combobox(controls, textvariable=self.date_filter_var, state="readonly", width=13)
+        self.date_filter_combo.grid(row=2, column=5, sticky="ew", pady=(10, 0))
+        ttk.Button(controls, text="重置筛选", command=self._reset_filters).grid(row=2, column=6, padx=(8, 0), pady=(10, 0))
+        for combo in (self.task_filter_combo, self.round_filter_combo, self.date_filter_combo):
+            combo.bind("<<ComboboxSelected>>", self._filter_changed)
+
+        table_holder = ttk.Frame(body, style="Surface.TFrame", padding=1)
+        table_holder.grid(row=1, column=0, sticky="nsew")
+        table_holder.rowconfigure(0, weight=1)
+        table_holder.columnconfigure(0, weight=1)
+        self.table = ttk.Treeview(
+            table_holder,
+            columns=("role", "task", "round", "progress", "objective", "quantity", "cost", "updated"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, label, width in (
+            ("role", "角色", 120),
+            ("task", "任务", 150),
+            ("round", "轮次", 60),
+            ("progress", "当前步骤", 100),
+            ("objective", "任务目标", 170),
+            ("quantity", "需求", 70),
+            ("cost", "行情成本", 170),
+            ("updated", "最后识别", 140),
+        ):
+            self.table.heading(column, text=label)
+            self.table.column(column, width=width, minwidth=90, anchor="w", stretch=column == "task")
+        self.table.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(table_holder, orient="vertical", command=self.table.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.table.configure(yscrollcommand=scrollbar.set)
+
+        footer = ttk.Frame(body)
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=parent.task_progress_status_var, style="Note.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="删除所选", command=self._delete_selected).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(footer, text="清空记录", command=self._clear_records).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(footer, text="关闭", command=self.close).grid(row=0, column=3, padx=(8, 0))
+        self._refresh_table()
+        self.after(100, role_entry.focus_set)
+
+    def _save_role(self, _event: tk.Event | None = None) -> str:
+        self.parent_app.task_role_var.set(self.parent_app.task_role_var.get().strip())
+        self.parent_app._save_settings()
+        self._refresh_table()
+        return "break"
+
+    def _record_current_ocr(self) -> None:
+        lines = self.parent_app.raw_text.get("1.0", "end").splitlines()
+        self.parent_app._record_task_progress(lines)
+        self._refresh_table()
+
+    def _filter_changed(self, _event: tk.Event | None = None) -> None:
+        self._refresh_table()
+
+    def _reset_filters(self) -> None:
+        self.task_filter_var.set("全部")
+        self.round_filter_var.set("全部")
+        self.date_filter_var.set("全部")
+        self._refresh_table()
+
+    @staticmethod
+    def _select_filter_value(variable: tk.StringVar, values: tuple[str, ...]) -> None:
+        if variable.get() not in values:
+            variable.set("全部")
+
+    def _refresh_filter_values(self) -> None:
+        records = list(self.parent_app.task_records.values())
+        task_values = ("全部", *sorted({record.task for record in records}))
+        round_values = ("全部", *(f"第 {value} 轮" for value in sorted({record.round_index for record in records})))
+        date_values = ("全部", *sorted({record.updated_at[:10] for record in records if len(record.updated_at) >= 10}, reverse=True))
+        self.task_filter_combo.configure(values=task_values)
+        self.round_filter_combo.configure(values=round_values)
+        self.date_filter_combo.configure(values=date_values)
+        self._select_filter_value(self.task_filter_var, task_values)
+        self._select_filter_value(self.round_filter_var, round_values)
+        self._select_filter_value(self.date_filter_var, date_values)
+
+    def _delete_selected(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            return
+        key = self.row_keys.get(selected[0])
+        if key:
+            self.parent_app.task_records.pop(key, None)
+            self.parent_app._save_task_records()
+            self.parent_app.task_progress_status_var.set("已删除所选步数记录。")
+        self._refresh_table()
+
+    def _clear_records(self) -> None:
+        if not self.parent_app.task_records:
+            return
+        if not messagebox.askyesno("清空记录", "确定清空所有角色的任务步数记录吗？", parent=self):
+            return
+        self.parent_app.task_records.clear()
+        self.parent_app._save_task_records()
+        self.parent_app.task_progress_status_var.set("已清空任务步数记录。")
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        for item_id in self.table.get_children():
+            self.table.delete(item_id)
+        self.row_keys.clear()
+        selected_role = self.parent_app.task_role_var.get().strip()
+        self.round_summary_var.set(self.parent_app.task_round_summary_text(selected_role))
+        self._refresh_filter_values()
+        round_text = self.round_filter_var.get()
+        round_match = re.fullmatch(r"第\s*(\d+)\s*轮", round_text)
+        selected_round = int(round_match.group(1)) if round_match else None
+        selected_task = self.task_filter_var.get() if self.task_filter_var.get() != "全部" else ""
+        selected_date = self.date_filter_var.get() if self.date_filter_var.get() != "全部" else ""
+        records = filter_task_progress_records(
+            self.parent_app.task_records,
+            role=selected_role,
+            task=selected_task,
+            round_index=selected_round,
+            date=selected_date,
+        )
+        records.sort(
+            key=lambda record: (
+                record.role,
+                record.task,
+                record.round_index,
+                record.current_step,
+                record.updated_at,
+            )
+        )
+        for index, record in enumerate(records):
+            item_id = str(index)
+            self.row_keys[item_id] = task_record_key(record)
+            self.table.insert(
+                "", "end", iid=item_id,
+                values=(
+                    record.role, record.task, f"第 {record.round_index} 轮", record.display_progress, record.display_objective,
+                    record.display_quantity, record.display_cost, record.updated_at,
+                ),
+            )
+        if not records:
+            self.parent_app.task_progress_status_var.set("识别到任务进度后会自动记录在这里。")
+
+    def close(self) -> None:
+        self.parent_app._save_settings()
+        self.destroy()
+
+
 class AboutDialog(tk.Toplevel):
     """Show the installed version, bundled changelog, and GitHub release status."""
 
     def __init__(self, parent: tk.Tk) -> None:
         super().__init__(parent)
+        self.parent_app = parent
         self.title("关于与更新")
         self.geometry("760x560")
         self.minsize(620, 420)
@@ -1057,16 +1591,27 @@ class AboutDialog(tk.Toplevel):
         changelog_scrollbar = ttk.Scrollbar(changelog_holder, orient="vertical", command=changelog_text.yview)
         changelog_scrollbar.grid(row=0, column=1, sticky="ns")
         changelog_text.configure(yscrollcommand=changelog_scrollbar.set)
-        changelog_text.insert("1.0", load_changelog())
+        changelog_text.insert("1.0", render_changelog(load_changelog()))
         changelog_text.configure(state="disabled")
 
         footer = ttk.Frame(body)
         footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.update_status_var, style="Note.TLabel").grid(row=0, column=0, sticky="w")
+        self.hide_on_start_var = tk.BooleanVar(value=not parent.show_changelog_on_start_var.get())
+        ttk.Checkbutton(
+            footer,
+            text="启动时不再显示",
+            variable=self.hide_on_start_var,
+            command=self._save_changelog_preference,
+        ).grid(row=0, column=1, padx=(8, 0))
         self.check_button = ttk.Button(footer, text="检查更新", command=self._check_for_updates)
-        self.check_button.grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(footer, text="打开 Release 页面", command=self._open_release_page).grid(row=0, column=2, padx=(8, 0))
+        self.check_button.grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(footer, text="打开 Release 页面", command=self._open_release_page).grid(row=0, column=3, padx=(8, 0))
+
+    def _save_changelog_preference(self) -> None:
+        self.parent_app.show_changelog_on_start_var.set(not self.hide_on_start_var.get())
+        self.parent_app._save_settings()
 
     def _check_for_updates(self) -> None:
         self.check_button.configure(state="disabled")
@@ -1309,6 +1854,82 @@ class FlashAlertDialog(tk.Toplevel):
         self.destroy()
 
 
+class CloudOcrSettingsDialog(tk.Toplevel):
+    """Configure the optional cloud OCR service without embedding credentials."""
+
+    def __init__(self, parent: "GuolingTaskOcr") -> None:
+        super().__init__(parent)
+        self.parent_app = parent
+        self.title("云端 OCR 设置")
+        self.geometry("720x440")
+        self.minsize(620, 400)
+        self.transient(parent)
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        mode = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        mode.grid(row=0, column=0, sticky="ew")
+        ttk.Label(mode, text="识别方式", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Radiobutton(mode, text="本地 PaddleOCR（默认）", value="local", variable=parent.ocr_mode_var, command=self._save).grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Radiobutton(mode, text="云端 PaddleOCR API", value="cloud", variable=parent.ocr_mode_var, command=self._save).grid(
+            row=1, column=1, sticky="w", padx=(28, 0)
+        )
+        ttk.Label(
+            mode,
+            text="云端模式会上传待识别的游戏截图；启用后，后续识别不会加载本地 PaddleOCR 模型。",
+            style="Note.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(9, 0))
+
+        credentials = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        credentials.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        credentials.columnconfigure(1, weight=1)
+        ttk.Label(credentials, text="云端 API", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(credentials, text="API 令牌", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10))
+        token_entry = ttk.Entry(credentials, textvariable=parent.cloud_ocr_token_var, show="*")
+        token_entry.grid(row=1, column=1, sticky="ew")
+        ttk.Label(credentials, text="模型", style="Field.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(9, 0))
+        ttk.Entry(credentials, textvariable=parent.cloud_ocr_model_var).grid(row=2, column=1, sticky="ew", pady=(9, 0))
+        ttk.Label(credentials, text="新版 API 地址", style="Field.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(9, 0))
+        ttk.Entry(credentials, textvariable=parent.cloud_ocr_api_url_var).grid(row=3, column=1, sticky="ew", pady=(9, 0))
+        ttk.Label(
+            credentials,
+            text="填写官方文档生成的新版 API 地址时使用同步接口；留空则使用 PP-OCRv6 兼容接口。",
+            style="Note.TLabel",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        ttk.Label(
+            credentials,
+            text="令牌仅保存到本机设置文件，且不会写入日志或项目文件。请勿分享或提交令牌。",
+            style="Note.TLabel",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        footer = ttk.Frame(body)
+        footer.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(
+            footer,
+            text="若本地模型已加载，切换到云端后重启助手可立即释放其内存占用。",
+            style="Note.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="保存", command=self.close, style="Primary.TButton").grid(row=0, column=1)
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.after(100, token_entry.focus_set)
+
+    def _save(self) -> None:
+        self.parent_app.cloud_ocr_token_var.set(self.parent_app.cloud_ocr_token_var.get().strip())
+        self.parent_app.cloud_ocr_model_var.set(self.parent_app.cloud_ocr_model_var.get().strip() or DEFAULT_CLOUD_OCR_MODEL)
+        self.parent_app.cloud_ocr_api_url_var.set(self.parent_app.cloud_ocr_api_url_var.get().strip())
+        self.parent_app._save_settings()
+
+    def close(self) -> None:
+        self._save()
+        self.destroy()
+
+
 class MarketSettingsDialog(tk.Toplevel):
     """Configure the user-authorized account used by the main-window market panel."""
 
@@ -1429,10 +2050,16 @@ class GuolingTaskOcr(tk.Tk):
         self.cached_task_region: tuple[float, float, float, float] | None = None
         self.cached_task_window: int | None = None
         self.last_task_signature: bytes | None = None
+        self.last_detected_role = ""
         self.last_valid_item = ""
+        self.last_ocr_is_monster_target = False
+        self.last_ocr_target_kind = ""
         self.preview_image: ImageTk.PhotoImage | None = None
         self.ocr_engine = None
+        self.ocr_lock = threading.Lock()
+        self.cloud_ocr_client = CloudOcrClient()
         self.ocr_in_progress = False
+        self.role_check_in_progress = False
         self.hotkey_id = None
         settings = load_user_settings()
         self.auto_var = tk.BooleanVar(value=False)
@@ -1445,6 +2072,15 @@ class GuolingTaskOcr(tk.Tk):
         self.flash_wav_path_var = tk.StringVar(value=str(settings["flash_wav_path"]))
         self.flash_cooldown_var = tk.StringVar(value=f"{float(settings['flash_cooldown_seconds']):g}")
         self.flash_enabled_var = tk.BooleanVar(value=bool(settings["flash_enabled"]))
+        saved_role = str(settings["task_tracker_role"]).strip()
+        self.task_role_var = tk.StringVar(value=saved_role if is_role_name_candidate(saved_role) else "")
+        self.show_changelog_on_start_var = tk.BooleanVar(value=bool(settings["show_changelog_on_start"]))
+        self.task_records: dict[tuple[str, str, int, int], TaskProgress] = load_task_progress(TASK_PROGRESS_PATH)
+        self.last_task_record_key: tuple[str, str, int, int] | None = None
+        saved_bindings = settings["window_role_bindings"]
+        self.window_role_bindings: dict[str, str] = dict(saved_bindings) if isinstance(saved_bindings, dict) else {}
+        self.role_binding_var = tk.StringVar()
+        self.task_progress_status_var = tk.StringVar(value="识别到任务进度后会自动记录。")
         self.market_account_var = tk.StringVar(value=str(settings["market_account"]))
         self.market_region_var = tk.StringVar(value=str(settings["market_region"]))
         market_token = str(settings["market_token"]).strip()
@@ -1457,9 +2093,14 @@ class GuolingTaskOcr(tk.Tk):
         self.market_client = MarketClient()
         self.market_item_var = tk.StringVar()
         self.market_auto_query_var = tk.BooleanVar(value=bool(settings["market_auto_query"]))
+        self.ocr_mode_var = tk.StringVar(value=str(settings["ocr_mode"]))
+        self.cloud_ocr_token_var = tk.StringVar(value=str(settings["cloud_ocr_token"]))
+        self.cloud_ocr_model_var = tk.StringVar(value=str(settings["cloud_ocr_model"]))
+        self.cloud_ocr_api_url_var = tk.StringVar(value=str(settings["cloud_ocr_api_url"]))
         self.market_status_var = tk.StringVar(value="请在“行情设置”中登录后查询摊位和商行信息。")
         self.market_detail_var = tk.StringVar()
         self.market_rows: dict[str, dict[str, str]] = {}
+        self.market_last_keyword = ""
         self.market_busy = False
         self.market_last_auto_query: tuple[str, str] | None = None
         self.flash_events: Queue[FlashEvent] = Queue(maxsize=FLASH_EVENT_QUEUE_SIZE)
@@ -1480,6 +2121,7 @@ class GuolingTaskOcr(tk.Tk):
         self.after(250, self.refresh_flash_windows)
         self.after(300, self._restore_flash_monitor)
         self.after(100, self._process_flash_events)
+        self.after(450, self._show_changelog_on_start)
 
     def _style_legacy(self) -> None:
         style = ttk.Style(self)
@@ -1603,7 +2245,6 @@ class GuolingTaskOcr(tk.Tk):
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(3, weight=1)
-        root.rowconfigure(4, weight=1)
 
         header = ttk.Frame(root, style="Header.TFrame", padding=(18, 14))
         header.grid(row=0, column=0, sticky="ew")
@@ -1616,12 +2257,13 @@ class GuolingTaskOcr(tk.Tk):
 
         source = ttk.Frame(root, style="Surface.TFrame", padding=(14, 11))
         source.grid(row=1, column=0, sticky="ew", pady=(12, 8))
-        source.columnconfigure(1, weight=1, minsize=390)
+        source.columnconfigure(1, weight=1, minsize=250)
+        source.columnconfigure(3, weight=1, minsize=220)
         ttk.Label(source, text="游戏窗口", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.window_combo = ttk.Combobox(source, textvariable=self.window_var, state="readonly", width=46)
-        self.window_combo.grid(row=0, column=1, sticky="ew")
-        ttk.Button(source, text="刷新", command=self.refresh_game_windows).grid(row=0, column=2, padx=(8, 8))
-        ttk.Button(source, text="截取窗口", command=self.capture_selected_window, style="Primary.TButton").grid(row=0, column=3, padx=(4, 0))
+        self.window_combo.grid(row=0, column=1, columnspan=3, sticky="ew")
+        ttk.Button(source, text="刷新", command=self.refresh_game_windows).grid(row=0, column=4, padx=(8, 8))
+        ttk.Button(source, text="截取窗口", command=self.capture_selected_window, style="Primary.TButton").grid(row=0, column=5, padx=(4, 0))
         ttk.Label(source, text="截图方式", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
         self.capture_method_combo = ttk.Combobox(
             source,
@@ -1632,20 +2274,54 @@ class GuolingTaskOcr(tk.Tk):
         )
         self.capture_method_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
         self.capture_method_combo.bind("<<ComboboxSelected>>", self._save_settings)
-        self.window_combo.bind("<<ComboboxSelected>>", self._save_settings)
+        self.window_combo.bind("<<ComboboxSelected>>", self._on_game_window_selected)
+        ttk.Label(source, text="绑定角色", style="Field.TLabel").grid(
+            row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 8)
+        )
+        self.task_role_entry = ttk.Entry(source, textvariable=self.task_role_var)
+        self.task_role_entry.grid(row=1, column=3, sticky="ew", pady=(8, 0))
+        self.task_role_entry.bind("<FocusOut>", self._save_task_role)
+        self.task_role_entry.bind("<Return>", self._save_task_role)
+        ttk.Button(source, text="绑定窗口", command=self.bind_selected_window_role).grid(
+            row=1, column=4, padx=(8, 8), pady=(8, 0)
+        )
+        ttk.Button(source, text="解除绑定", command=self.unbind_selected_window_role).grid(
+            row=1, column=5, pady=(8, 0)
+        )
 
         tools = ttk.Frame(root, style="Surface.TFrame", padding=(14, 9))
         tools.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        tools.columnconfigure(1, weight=1)
+        tools.columnconfigure(0, weight=1)
 
         capture_tools = ttk.Frame(tools, style="Toolbar.TFrame")
         capture_tools.grid(row=0, column=0, sticky="w")
         ttk.Button(capture_tools, text="框选屏幕", command=self.capture_and_select, width=10).pack(side="left")
         ttk.Button(capture_tools, text="载入截图", command=self.load_image, width=10).pack(side="left", padx=(7, 0))
         ttk.Button(capture_tools, text="默认区域", command=self.default_crop, width=10).pack(side="left", padx=(7, 0))
+        utility_button = ttk.Menubutton(capture_tools, text="工具与设置")
+        utility_button.pack(side="left", padx=(12, 0))
+        utility_menu = tk.Menu(utility_button, tearoff=False)
+        utility_menu.add_command(label="录制快捷键", command=self.record_hotkey)
+        utility_menu.add_separator()
+        utility_menu.add_command(label="怪物词表", command=self.open_monster_lookup)
+        utility_menu.add_command(label="自定义词库", command=self.open_custom_vocabulary)
+        utility_menu.add_command(label="云端 OCR 设置", command=self.open_cloud_ocr_settings)
+        utility_menu.add_command(label="行情设置", command=self.open_market_settings)
+        utility_menu.add_checkbutton(
+            label="闪烁提醒", variable=self.flash_enabled_var, command=self.toggle_flash_monitor,
+            onvalue=True, offvalue=False,
+        )
+        utility_menu.add_command(label="提醒设置", command=self.open_flash_alert)
+        utility_menu.add_separator()
+        utility_menu.add_command(label="关于 / 更新", command=self.open_about_dialog)
+        utility_button.configure(menu=utility_menu)
+        self.utility_menu = utility_menu
 
-        auto_tools = ttk.Frame(tools, style="Toolbar.TFrame")
-        auto_tools.grid(row=0, column=1, sticky="e")
+        right_tools = ttk.Frame(tools, style="Toolbar.TFrame")
+        right_tools.grid(row=0, column=1, sticky="e")
+
+        auto_tools = ttk.Frame(right_tools, style="Toolbar.TFrame")
+        auto_tools.pack(side="left")
         ttk.Checkbutton(auto_tools, text="实时识别", variable=self.auto_var, command=self.toggle_auto).pack(side="left")
         ttk.Label(auto_tools, text="间隔", style="Field.TLabel").pack(side="left", padx=(12, 5))
         self.interval_spinbox = ttk.Spinbox(
@@ -1662,33 +2338,27 @@ class GuolingTaskOcr(tk.Tk):
         self.interval_spinbox.bind("<Return>", self._validate_auto_interval)
         ttk.Label(auto_tools, text="秒", style="Field.TLabel").pack(side="left", padx=(5, 0))
 
-        settings_tools = ttk.Frame(tools, style="Toolbar.TFrame")
-        settings_tools.grid(row=1, column=0, sticky="w", pady=(9, 0))
-        ttk.Label(settings_tools, text="快捷键", style="Field.TLabel").pack(side="left")
-        ttk.Label(settings_tools, textvariable=self.hotkey_var, style="Field.TLabel", width=14).pack(side="left", padx=(8, 0))
-        ttk.Button(settings_tools, text="录制", command=self.record_hotkey).pack(side="left", padx=(6, 0))
-        ttk.Button(settings_tools, text="怪物词表", command=self.open_monster_lookup).pack(side="left", padx=(14, 0))
-        ttk.Button(settings_tools, text="自定义词库", command=self.open_custom_vocabulary).pack(side="left", padx=(7, 0))
-        ttk.Button(settings_tools, text="行情设置", command=self.open_market_settings).pack(side="left", padx=(7, 0))
-        ttk.Checkbutton(
-            settings_tools,
-            text="闪烁提醒",
-            variable=self.flash_enabled_var,
-            command=self.toggle_flash_monitor,
-        ).pack(side="left", padx=(14, 0))
-        ttk.Button(settings_tools, text="提醒设置", command=self.open_flash_alert).pack(side="left", padx=(7, 0))
-        ttk.Button(settings_tools, text="关于 / 更新", command=self.open_about_dialog).pack(side="left", padx=(7, 0))
-
-        recognition_actions = ttk.Frame(tools, style="Toolbar.TFrame")
-        recognition_actions.grid(row=1, column=1, sticky="e", pady=(9, 0))
+        recognition_actions = ttk.Frame(right_tools, style="Toolbar.TFrame")
+        recognition_actions.pack(side="left", padx=(18, 0))
         ttk.Button(recognition_actions, text="快捷识别", command=self.quick_capture_and_recognize, style="Quick.TButton").pack(side="left")
         self.recognize_button = ttk.Button(
             recognition_actions, text="识别并复制", command=self.recognize, state="disabled", style="Primary.TButton"
         )
         self.recognize_button.pack(side="left", padx=(8, 0))
 
-        content = ttk.Frame(root)
-        content.grid(row=3, column=0, sticky="nsew")
+        workspace = ttk.Notebook(root)
+        workspace.grid(row=3, column=0, sticky="nsew")
+        task_tab = ttk.Frame(workspace)
+        market_tab = ttk.Frame(workspace)
+        workspace.add(task_tab, text="任务识别")
+        workspace.add(market_tab, text="物品行情")
+        task_tab.columnconfigure(0, weight=1)
+        task_tab.rowconfigure(0, weight=1)
+        market_tab.columnconfigure(0, weight=1)
+        market_tab.rowconfigure(0, weight=1)
+
+        content = ttk.Frame(task_tab)
+        content.grid(row=0, column=0, sticky="nsew")
         content.columnconfigure(0, weight=4)
         content.columnconfigure(1, weight=5)
         content.rowconfigure(0, weight=1)
@@ -1708,22 +2378,39 @@ class GuolingTaskOcr(tk.Tk):
 
         result = ttk.Frame(content, style="Surface.TFrame", padding=12)
         result.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        result.rowconfigure(4, weight=1)
+        result.rowconfigure(5, weight=1)
         result.columnconfigure(0, weight=1)
-        ttk.Label(result, text="识别结果", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        ttk.Label(result, text="任务物品名", style="Field.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(result, text="识别结果", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ttk.Button(result, text="步数追踪", command=self.open_task_progress_dialog).grid(row=0, column=1, sticky="e", pady=(0, 10))
+        summary = ttk.Frame(result, style="Surface.TFrame", padding=(8, 6))
+        summary.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        summary.columnconfigure(1, weight=1)
+        summary.columnconfigure(3, weight=1)
+        self.recognized_role_var = tk.StringVar(value="未识别")
+        self.target_name_var = tk.StringVar(value="未识别")
+        self.target_quantity_var = tk.StringVar(value="-")
+        self.npc_name_var = tk.StringVar(value="-")
+        ttk.Label(summary, text="角色", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(summary, textvariable=self.recognized_role_var, style="Field.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 18))
+        ttk.Label(summary, text="任务目标", style="Field.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Label(summary, textvariable=self.target_name_var, style="Field.TLabel").grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Label(summary, text="需求数量", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Label(summary, textvariable=self.target_quantity_var, style="Field.TLabel").grid(row=1, column=1, sticky="w", padx=(8, 18), pady=(5, 0))
+        ttk.Label(summary, text="任务 NPC", style="Field.TLabel").grid(row=1, column=2, sticky="w", pady=(5, 0))
+        ttk.Label(summary, textvariable=self.npc_name_var, style="Field.TLabel").grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(5, 0))
+        ttk.Label(result, text="任务目标", style="Field.TLabel").grid(row=2, column=0, sticky="w")
         self.item_var = tk.StringVar()
         self.item_entry = ttk.Entry(result, textvariable=self.item_var, style="Result.TEntry")
-        self.item_entry.grid(row=2, column=0, sticky="ew", pady=(4, 13))
-        ttk.Button(result, text="复制", command=self.copy_item, style="Primary.TButton").grid(row=2, column=1, padx=(8, 0), pady=(4, 13))
-        ttk.Label(result, text="OCR 原始文本", style="Field.TLabel").grid(row=3, column=0, columnspan=2, sticky="nw")
+        self.item_entry.grid(row=3, column=0, sticky="ew", pady=(4, 13))
+        ttk.Button(result, text="复制", command=self.copy_item, style="Primary.TButton").grid(row=3, column=1, padx=(8, 0), pady=(4, 13))
+        ttk.Label(result, text="OCR 原始文本", style="Field.TLabel").grid(row=4, column=0, columnspan=2, sticky="nw")
         raw_holder = ttk.Frame(result, style="Surface.TFrame")
-        raw_holder.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        raw_holder.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
         raw_holder.rowconfigure(0, weight=1)
         raw_holder.columnconfigure(0, weight=1)
         self.raw_text = tk.Text(
             raw_holder,
-            height=9,
+            height=5,
             font=("Microsoft YaHei UI", 10),
             wrap="word",
             relief="solid",
@@ -1739,8 +2426,8 @@ class GuolingTaskOcr(tk.Tk):
         raw_scroll.grid(row=0, column=1, sticky="ns")
         self.raw_text.configure(yscrollcommand=raw_scroll.set)
 
-        market = ttk.Frame(root, style="Market.TFrame", padding=10)
-        market.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        market = ttk.Frame(market_tab, style="Market.TFrame", padding=10)
+        market.grid(row=0, column=0, sticky="nsew")
         market.columnconfigure(0, weight=1)
         market.rowconfigure(2, weight=1)
 
@@ -1789,7 +2476,12 @@ class GuolingTaskOcr(tk.Tk):
         market_table_holder.columnconfigure(0, weight=1)
         columns = ("source", "item_quantity", "owner", "stall_info", "coordinate", "price")
         self.market_table = ttk.Treeview(
-            market_table_holder, columns=columns, show="headings", selectmode="browse", style="Market.Treeview"
+            market_table_holder,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            style="Market.Treeview",
+            height=5,
         )
         for column, label, width, stretch in (
             ("source", "来源", 62, False),
@@ -1816,7 +2508,8 @@ class GuolingTaskOcr(tk.Tk):
 
         self.status_var = tk.StringVar(value="就绪。选择游戏窗口后即可截取并识别。")
         status = ttk.Label(root, textvariable=self.status_var, style="Status.TLabel", padding=(12, 8))
-        status.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        status.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self._refresh_role_binding_status()
 
     def _register_hotkey(self) -> None:
         try:
@@ -1890,6 +2583,18 @@ class GuolingTaskOcr(tk.Tk):
             pass
         self.market_settings = MarketSettingsDialog(self)
 
+    def open_cloud_ocr_settings(self) -> None:
+        """Open the optional cloud OCR configuration dialog."""
+        try:
+            if self.cloud_ocr_settings.winfo_exists():
+                self.cloud_ocr_settings.deiconify()
+                self.cloud_ocr_settings.lift()
+                self.cloud_ocr_settings.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.cloud_ocr_settings = CloudOcrSettingsDialog(self)
+
     def set_market_session(self, session: MarketSession) -> None:
         self.market_session = session
         self.market_account_var.set(session.account)
@@ -1903,7 +2608,10 @@ class GuolingTaskOcr(tk.Tk):
         self.market_status_var.set("请在“行情设置”中登录后查询。")
 
     def use_ocr_item_for_market(self) -> None:
-        item = self.item_var.get().strip()
+        if self.last_ocr_target_kind and self.last_ocr_target_kind != "item":
+            self.market_status_var.set("当前 OCR 目标不是物品，已跳过行情查询。")
+            return
+        item = normalize_market_keyword(self.item_var.get())
         if not item:
             self.market_status_var.set("当前没有 OCR 物品名，请手动输入后查询。")
             return
@@ -1928,6 +2636,7 @@ class GuolingTaskOcr(tk.Tk):
         self.market_status_var.set(f"OCR 后自动查询{state}。")
 
     def _auto_query_market_item(self, item: str) -> bool:
+        item = normalize_market_keyword(item)
         if not self.market_auto_query_var.get():
             return False
         query_key = (self.market_region_var.get().strip(), item)
@@ -1938,9 +2647,98 @@ class GuolingTaskOcr(tk.Tk):
             return True
         return False
 
+    def _on_game_window_selected(self, _event: tk.Event | None = None) -> None:
+        """Restore a manually bound role whenever the selected game window changes."""
+        self._save_settings()
+        role = self._bound_role_for_selected_window()
+        self.last_detected_role = role
+        self._refresh_role_binding_status()
+        if role:
+            self.task_role_var.set(role)
+            self.status_var.set(f"已切换游戏窗口；当前已绑定角色：{role}。")
+        else:
+            self.status_var.set("当前窗口尚未绑定角色；请在主窗口填写角色名后点击“绑定窗口”。")
+
+    def _bound_role_for_selected_window(self) -> str:
+        title = self._window_title_from_label(self.window_var.get())
+        return self.window_role_bindings.get(title, "")
+
+    def _refresh_role_binding_status(self) -> None:
+        """Keep the persistent role binding visible beside the selected window."""
+        title = self._window_title_from_label(self.window_var.get())
+        role = self.window_role_bindings.get(title, "")
+        if not title:
+            self.role_binding_var.set("请选择一个游戏窗口后再绑定角色。")
+        elif role:
+            self.role_binding_var.set(f"当前窗口已绑定角色：{role}")
+        else:
+            self.role_binding_var.set("当前窗口尚未绑定角色。")
+
+    def _save_task_role(self, _event: tk.Event | None = None) -> str:
+        self.task_role_var.set(self.task_role_var.get().strip())
+        self._save_settings()
+        return "break"
+
+    def bind_selected_window_role(self) -> bool:
+        title = self._window_title_from_label(self.window_var.get())
+        role = self.task_role_var.get().strip()
+        if not title:
+            self.task_progress_status_var.set("请先在主界面选择 QQ 三国窗口。")
+            return False
+        if not is_role_name_candidate(role):
+            self.task_progress_status_var.set("请填写有效角色名后再绑定当前窗口。")
+            return False
+        self.window_role_bindings[title] = role
+        self.last_detected_role = role
+        self._save_settings()
+        self._refresh_role_binding_status()
+        self.task_progress_status_var.set(f"已绑定窗口“{title}”到角色“{role}”。")
+        self.status_var.set(f"当前游戏窗口已绑定角色：{role}。")
+        return True
+
+    def unbind_selected_window_role(self) -> None:
+        title = self._window_title_from_label(self.window_var.get())
+        if not title or title not in self.window_role_bindings:
+            self.task_progress_status_var.set("当前窗口没有已保存的角色绑定。")
+            return
+        role = self.window_role_bindings.pop(title)
+        self.last_detected_role = ""
+        self._save_settings()
+        self._refresh_role_binding_status()
+        self.task_progress_status_var.set(f"已解除窗口“{title}”与角色“{role}”的绑定。")
+
+    def _confirm_role_for_window(self, hwnd: int, rect: tuple[int, int, int, int]) -> None:
+        try:
+            image, _capture_note = self._capture_selected_game_window(hwnd, rect)
+            role = self._recognize_player_role(image, hwnd)
+        except Exception as error:
+            logging.warning("Role confirmation failed for hwnd %s: %r", hwnd, error)
+            error_text = f"角色确认失败：{error!r}"
+            self.after(0, lambda: self._role_confirmation_done(hwnd, None, error_text))
+        else:
+            self.after(0, lambda: self._role_confirmation_done(hwnd, role, ""))
+
+    def _role_confirmation_done(self, hwnd: int, role: str | None, error: str) -> None:
+        self.role_check_in_progress = False
+        selected = self.game_windows.get(self.window_var.get())
+        if selected is None or selected[0] != hwnd:
+            return
+        if role:
+            self.last_detected_role = role
+            if role != self.task_role_var.get():
+                self.task_role_var.set(role)
+                self._save_settings()
+            self.status_var.set(f"已确认当前角色：{role}。")
+        elif error:
+            self.status_var.set(error)
+        else:
+            self.status_var.set("未能从左上角角色信息区识别角色名；可在主窗口手动填写并绑定。")
+
     def query_market(self) -> bool:
         session = self.market_session
-        keyword = self.market_item_var.get().strip()
+        keyword = normalize_market_keyword(self.market_item_var.get())
+        if keyword != self.market_item_var.get():
+            self.market_item_var.set(keyword)
         region = self.market_region_var.get().strip()
         if self.market_busy:
             return False
@@ -1980,6 +2778,7 @@ class GuolingTaskOcr(tk.Tk):
         for item_id in self.market_table.get_children():
             self.market_table.delete(item_id)
         self.market_rows.clear()
+        self.market_last_keyword = ""
         self.market_detail_var.set("")
         if error:
             self.market_status_var.set(f"查询失败：{error}")
@@ -1995,7 +2794,56 @@ class GuolingTaskOcr(tk.Tk):
                 values=(row["source"], item_quantity, row["owner"], row["stall_info"], row["coordinate"], row["price"]),
                 tags=("even" if index % 2 == 0 else "odd",),
             )
-        self.market_status_var.set(f"找到 {len(rows)} 条“{keyword}”行情记录。")
+        learned_name = learn_market_item_name(keyword, rows)
+        self.market_last_keyword = keyword
+        self._update_task_records_market_price(keyword, rows)
+        learned_note = f"；已学习物品名“{learned_name}”" if learned_name and learned_name != keyword else ""
+        self.market_status_var.set(f"找到 {len(rows)} 条“{keyword}”行情记录{learned_note}。")
+
+    @staticmethod
+    def _lowest_market_price(rows: list[dict[str, str]]) -> float | None:
+        prices: list[float] = []
+        for row in rows:
+            try:
+                price = float(row.get("price", "").replace(",", "").strip())
+            except (AttributeError, ValueError):
+                continue
+            if price >= 0:
+                prices.append(price)
+        return min(prices) if prices else None
+
+    def _cached_market_price(self, item: str) -> float | None:
+        if normalize_market_keyword(item) != self.market_last_keyword:
+            return None
+        return self._lowest_market_price(list(self.market_rows.values()))
+
+    def _update_task_records_market_price(self, keyword: str, rows: list[dict[str, str]]) -> None:
+        """Fill in costs after the asynchronous market result becomes available."""
+        unit_price = self._lowest_market_price(rows)
+        if unit_price is None:
+            return
+        updated = False
+        key = self.last_task_record_key
+        record = self.task_records.get(key) if key is not None else None
+        if (
+            record is not None
+            and record.objective_kind == "item"
+            and normalize_market_keyword(record.objective_name) == keyword
+        ):
+            self.task_records[key] = replace(
+                record,
+                unit_price=unit_price,
+                total_price=unit_price * record.required_quantity,
+            )
+            updated = True
+        if not updated:
+            return
+        self._save_task_records()
+        try:
+            if self.task_progress_dialog.winfo_exists():
+                self.task_progress_dialog._refresh_table()
+        except AttributeError:
+            pass
 
     def _show_market_detail(self, _event: tk.Event) -> None:
         selected = self.market_table.selection()
@@ -2013,6 +2861,86 @@ class GuolingTaskOcr(tk.Tk):
         except AttributeError:
             pass
         self.about_dialog = AboutDialog(self)
+
+    def _show_changelog_on_start(self) -> None:
+        if self.show_changelog_on_start_var.get() and self.winfo_exists():
+            self.open_about_dialog()
+
+    def open_task_progress_dialog(self) -> None:
+        """Open the per-role local tracker for multi-step tasks."""
+        try:
+            if self.task_progress_dialog.winfo_exists():
+                self.task_progress_dialog.deiconify()
+                self.task_progress_dialog.lift()
+                self.task_progress_dialog.focus_force()
+                return
+        except AttributeError:
+            pass
+        self.task_progress_dialog = TaskProgressDialog(self)
+
+    def _save_task_records(self) -> None:
+        try:
+            save_task_progress(self.task_records, TASK_PROGRESS_PATH)
+        except OSError:
+            logging.warning("Unable to save task progress to %s", TASK_PROGRESS_PATH, exc_info=True)
+
+    def task_round_summary_text(self, role: str) -> str:
+        if not role:
+            return "绑定窗口或填写当前角色后，可查看本轮已记录的三国币成本。"
+        summaries = summarize_task_rounds(self.task_records, role)
+        if not summaries:
+            return "当前角色还没有任务记录。"
+        parts: list[str] = []
+        for summary in summaries:
+            progress = f"{summary.recorded_steps}/{summary.total_steps}" if summary.total_steps else str(summary.recorded_steps)
+            cost = f"{summary.total_cost:,.2f}".rstrip("0").rstrip(".")
+            parts.append(f"{summary.task} 第 {summary.round_index} 轮 {progress} 步，已记录成本 {cost} 三国币")
+        return "；".join(parts)
+
+    def _record_task_progress(
+        self,
+        lines: list[str],
+        detected_role: str | None = None,
+        objective: TaskObjective | None = None,
+        unit_price: float | None = None,
+    ) -> TaskProgress | None:
+        role = self._bound_role_for_selected_window() or self.task_role_var.get().strip()
+        objective = objective if objective is not None else parse_task_objective(lines)
+        parsed = parse_task_progress(lines)
+        if parsed is None and role:
+            task = find_task_name(lines)
+            inferred_step = infer_unread_task_step(self.task_records, role, task, objective) if task else None
+            if task and inferred_step is not None:
+                parsed = ParsedTaskProgress(task, inferred_step, 0)
+                logging.info(
+                    "Recovered missing task step from local progress: role=%s task=%s step=%s lines=%r",
+                    role, task, inferred_step, lines,
+                )
+        if parsed is None:
+            logging.info("Task progress not recorded because no valid task step was recognized: %r", lines)
+            self.task_progress_status_var.set("已识别任务目标，但未识别到有效步骤，暂未写入记录。")
+            return None
+        if role and role != self.task_role_var.get():
+            self.task_role_var.set(role)
+            self._save_settings()
+        if not role:
+            self.task_progress_status_var.set(f"识别到“{parsed.task}”进度，请在主窗口填写并绑定当前角色。")
+            return None
+        if objective is not None and objective.kind == "item" and unit_price is None:
+            unit_price = self._cached_market_price(objective.name)
+        record = record_task_progress(self.task_records, role, parsed, objective, unit_price)
+        self.last_task_record_key = task_record_key(record)
+        self._save_task_records()
+        cost_note = f" · {record.display_cost}" if record.objective_kind == "item" else ""
+        self.task_progress_status_var.set(
+            f"已记录：{record.role} · {record.task} · 第 {record.round_index} 轮 · {record.display_progress}{cost_note}"
+        )
+        try:
+            if self.task_progress_dialog.winfo_exists():
+                self.task_progress_dialog._refresh_table()
+        except AttributeError:
+            pass
+        return record
 
     def open_flash_alert(self) -> None:
         """Open the integrated Windows taskbar-flash sound reminder."""
@@ -2111,11 +3039,18 @@ class GuolingTaskOcr(tk.Tk):
             "flash_wav_path": self.flash_wav_path_var.get(),
             "flash_cooldown_seconds": self._flash_cooldown_seconds(),
             "flash_enabled": self.flash_enabled_var.get(),
+            "task_tracker_role": self.task_role_var.get(),
+            "window_role_bindings": self.window_role_bindings,
+            "show_changelog_on_start": self.show_changelog_on_start_var.get(),
             "market_account": self.market_account_var.get(),
             "market_token": self.market_session.token if self.market_session else "",
             "market_user_id": self.market_session.user_id if self.market_session else "",
             "market_region": self.market_region_var.get(),
             "market_auto_query": self.market_auto_query_var.get(),
+            "ocr_mode": self.ocr_mode_var.get(),
+            "cloud_ocr_token": self.cloud_ocr_token_var.get().strip(),
+            "cloud_ocr_model": self.cloud_ocr_model_var.get().strip() or DEFAULT_CLOUD_OCR_MODEL,
+            "cloud_ocr_api_url": self.cloud_ocr_api_url_var.get().strip(),
         })
 
     def _flash_cooldown_seconds(self) -> float:
@@ -2216,6 +3151,12 @@ class GuolingTaskOcr(tk.Tk):
         else:
             self.window_var.set("")
             self.status_var.set("未发现 QQ 三国窗口。请先启动游戏，或使用手动截图框选。")
+
+        role = self._bound_role_for_selected_window()
+        if role:
+            self.last_detected_role = role
+            self.task_role_var.set(role)
+        self._refresh_role_binding_status()
 
     def capture_selected_window(self) -> None:
         selection = self.game_windows.get(self.window_var.get())
@@ -2355,6 +3296,10 @@ class GuolingTaskOcr(tk.Tk):
     def recognize(self, skip_unchanged: bool = False) -> None:
         if self.ocr_in_progress:
             return
+        cloud_mode = self.ocr_mode_var.get() == "cloud"
+        if cloud_mode:
+            self.cached_task_region = None
+            self.cached_task_window = None
         if self.locate_from_source and self.source_image:
             image = self.source_image.copy()
             locate_from_source = True
@@ -2371,6 +3316,8 @@ class GuolingTaskOcr(tk.Tk):
         self.recognize_button.configure(state="disabled")
         if cached_region:
             self.status_var.set("正在识别缓存的任务区域……")
+        elif cloud_mode:
+            self.status_var.set("正在上传截图并等待云端 OCR 识别……")
         else:
             self.status_var.set("正在定位任务区域并识别中文文字；首次使用会初始化 OCR 模型，请稍候……")
         threading.Thread(
@@ -2388,18 +3335,9 @@ class GuolingTaskOcr(tk.Tk):
         skip_unchanged: bool,
     ) -> None:
         try:
-            from paddleocr import PaddleOCR
-            import numpy as np
-
-            if self.ocr_engine is None:
-                ensure_writable_error_stream()
-                self.ocr_engine = PaddleOCR(
-                    lang="ch",
-                    use_angle_cls=False,
-                    show_log=False,
-                    **ocr_model_directories(),
-                )
-            full_window_image = image.copy() if locate_from_source and window_handle is not None else None
+            cloud_mode = self.ocr_mode_var.get() == "cloud"
+            full_window_image = image.copy() if locate_from_source and window_handle is not None and not cloud_mode else None
+            detected_role = None
             location_note = "手动选择的区域"
             used_cached_region = cached_region is not None
             region_for_cache: tuple[float, float, float, float] | None = None
@@ -2407,10 +3345,15 @@ class GuolingTaskOcr(tk.Tk):
                 image = self._crop_relative_region(image, cached_region)
                 location_note = "缓存定位：任务追踪区域"
             elif locate_from_source:
-                full_image = self._limit_ocr_size(image)
-                full_entries = self._ocr_entries(np.array(full_image))
-                image, location_note, crop_box = locate_task_panel(full_image, full_entries)
-                region_for_cache = self._relative_region(crop_box, full_image.size)
+                if cloud_mode:
+                    crop_box = cloud_task_crop_box(image)
+                    image = image.crop(crop_box)
+                    location_note = "云端快速模式：右侧任务区域"
+                else:
+                    full_image = self._limit_ocr_size(image)
+                    full_entries = self._ocr_image_entries(full_image)
+                    image, location_note, crop_box = locate_task_panel(full_image, full_entries)
+                    region_for_cache = self._relative_region(crop_box, full_image.size)
 
             signature = self._task_signature(image)
             if used_cached_region and should_skip_unchanged_task(
@@ -2419,14 +3362,14 @@ class GuolingTaskOcr(tk.Tk):
                 self.after(0, self._show_unchanged_frame)
                 return
 
-            lines, final_crop = self._recognize_task_crop(image, np)
+            lines, final_crop = self._recognize_task_crop(image)
 
             # A misleading full-window anchor can select player names or scenery.
             # Fall back before presenting or caching that crop if it has no task text.
             if full_window_image is not None and not has_task_panel_context(lines):
                 fallback_box = default_task_crop_box(full_window_image)
                 fallback_image = full_window_image.crop(fallback_box)
-                fallback_lines, fallback_crop = self._recognize_task_crop(fallback_image, np)
+                fallback_lines, fallback_crop = self._recognize_task_crop(fallback_image)
                 if has_task_panel_context(fallback_lines) or extract_candidate(fallback_lines):
                     lines = fallback_lines
                     final_crop = fallback_crop
@@ -2436,9 +3379,12 @@ class GuolingTaskOcr(tk.Tk):
             self.after(
                 0,
                 lambda: self._show_result(
-                    lines, final_crop, location_note, window_handle, region_for_cache, signature
+                    lines, final_crop, location_note, window_handle, region_for_cache, signature, detected_role
                 ),
             )
+        except CloudOcrError as error:
+            error_text = f"云端 OCR：{error}"
+            self.after(0, lambda: self._show_error(error_text))
         except ModuleNotFoundError:
             self.after(0, lambda: self._show_error("缺少 OCR 依赖。请先双击“安装国令助手依赖.cmd”，完成后重新启动程序。"))
         except Exception as error:
@@ -2448,16 +3394,60 @@ class GuolingTaskOcr(tk.Tk):
             error_text = f"识别失败：{error!r}"
             self.after(0, lambda: self._show_error(error_text))
 
-    def _recognize_task_crop(self, image: Image.Image, numpy_module: object) -> tuple[list[str], Image.Image]:
+    def _recognize_task_crop(self, image: Image.Image) -> tuple[list[str], Image.Image]:
         """Run the task-area OCR pass, including a higher-contrast retry."""
-        scaled = image.resize(task_ocr_target_size(image.size), Image.Resampling.LANCZOS)
+        target_size = cloud_task_ocr_target_size(image.size) if self.ocr_mode_var.get() == "cloud" else task_ocr_target_size(image.size)
+        scaled = image.resize(target_size, Image.Resampling.LANCZOS)
         enhanced = ImageEnhance.Sharpness(ImageEnhance.Contrast(ImageOps.grayscale(scaled)).enhance(2.2)).enhance(2.0)
-        entries = self._ocr_entries(numpy_module.array(scaled))
-        if not entries:
-            entries = self._ocr_entries(numpy_module.array(enhanced.convert("RGB")))
+        entries = self._ocr_image_entries(scaled)
+        if not entries and self.ocr_mode_var.get() != "cloud":
+            entries = self._ocr_image_entries(enhanced.convert("RGB"))
         lines = [text for _box, text in entries]
         final_crop = scaled.resize(image.size, Image.Resampling.LANCZOS)
         return lines, final_crop
+
+    def _ensure_ocr_engine(self) -> None:
+        """Initialize the shared OCR engine once for task and role recognition."""
+        with self.ocr_lock:
+            if self.ocr_engine is not None:
+                return
+            from paddleocr import PaddleOCR
+
+            ensure_writable_error_stream()
+            self.ocr_engine = PaddleOCR(
+                lang="ch",
+                use_angle_cls=False,
+                show_log=False,
+                **ocr_model_directories(),
+            )
+
+    def _recognize_player_role(self, image: Image.Image, hwnd: int | None = None) -> str | None:
+        """Read the character name from QQ SG's upper-left player information HUD."""
+        player_crop = image.crop(player_info_crop_box(image, game_client_box(hwnd, image)))
+        scaled = player_crop.resize(player_ocr_target_size(player_crop.size), Image.Resampling.LANCZOS)
+        entries = self._ocr_image_entries(scaled)
+        role = find_hud_role_name(entries)
+        if role:
+            return correct_role_name(role)
+        name_crop = crop_player_name_from_level(scaled, entries)
+        if name_crop is not None:
+            name_entries = self._ocr_image_entries(name_crop)
+            role = find_hud_role_name(name_entries, allow_isolated_name=True)
+            if role:
+                return correct_role_name(role)
+        enhanced = ImageEnhance.Sharpness(ImageEnhance.Contrast(ImageOps.grayscale(scaled)).enhance(2.4)).enhance(2.0)
+        if self.ocr_mode_var.get() == "cloud":
+            return None
+        entries = self._ocr_image_entries(enhanced.convert("RGB"))
+        role = find_hud_role_name(entries)
+        if role:
+            return correct_role_name(role)
+        name_crop = crop_player_name_from_level(enhanced, entries)
+        if name_crop is None:
+            return None
+        name_entries = self._ocr_image_entries(name_crop.convert("RGB"))
+        role = find_hud_role_name(name_entries, allow_isolated_name=True)
+        return correct_role_name(role) if role else None
 
     @staticmethod
     def _limit_ocr_size(image: Image.Image, max_edge: int = 1600) -> Image.Image:
@@ -2489,7 +3479,8 @@ class GuolingTaskOcr(tk.Tk):
         return sum(abs(left - right) for left, right in zip(first, second)) / len(first)
 
     def _ocr_entries(self, image_array: object) -> list[tuple[list[list[float]], str]]:
-        result = self.ocr_engine.ocr(image_array, cls=False)
+        with self.ocr_lock:
+            result = self.ocr_engine.ocr(image_array, cls=False)
         entries: list[tuple[list[list[float]], str]] = []
         for entry in result[0] or []:
             if not entry or not entry[1][0].strip():
@@ -2497,6 +3488,20 @@ class GuolingTaskOcr(tk.Tk):
             box = [[float(point[0]), float(point[1])] for point in entry[0]]
             entries.append((box, entry[1][0].strip()))
         return entries
+
+    def _ocr_image_entries(self, image: Image.Image) -> list[tuple[list[list[float]], str]]:
+        """Recognize a PIL image while keeping cloud mode free of local OCR imports."""
+        if self.ocr_mode_var.get() == "cloud":
+            return self.cloud_ocr_client.recognize(
+                image,
+                self.cloud_ocr_token_var.get(),
+                self.cloud_ocr_model_var.get().strip() or DEFAULT_CLOUD_OCR_MODEL,
+                self.cloud_ocr_api_url_var.get(),
+            )
+        import numpy as np
+
+        self._ensure_ocr_engine()
+        return self._ocr_entries(np.array(image))
 
     def _show_unchanged_frame(self) -> None:
         self.ocr_in_progress = False
@@ -2511,6 +3516,7 @@ class GuolingTaskOcr(tk.Tk):
         window_handle: int | None,
         region_for_cache: tuple[float, float, float, float] | None,
         signature: bytes,
+        detected_role: str | None,
     ) -> None:
         self.crop_image = crop_image
         self.locate_from_source = False
@@ -2520,8 +3526,29 @@ class GuolingTaskOcr(tk.Tk):
         self.preview_label.configure(image=self.preview_image, text="")
         self.raw_text.delete("1.0", "end")
         self.raw_text.insert("1.0", "\n".join(lines) if lines else "未识别到文字，请重新框选更紧凑的任务要求区域。")
-        candidate = correct_item_name(extract_candidate(lines))
+        objective = parse_task_objective(lines)
+        raw_candidate = objective.name if objective else extract_candidate(lines)
+        candidate = raw_candidate if objective and objective.kind != "item" else correct_item_name(raw_candidate)
+        npc_name = correct_npc_name(objective.npc) if objective and objective.npc else ""
+        if objective and objective.kind == "npc":
+            candidate = npc_name or correct_npc_name(candidate)
+        target_kind = objective.kind if objective else ""
+        monster_target = is_monster_task_target(lines, candidate, target_kind)
+        non_item_target = target_kind in {"monster", "npc"} or monster_target
+        self.last_ocr_is_monster_target = monster_target
+        self.last_ocr_target_kind = "monster" if monster_target else target_kind
+        objective_for_record = replace(objective, name=candidate) if objective and objective.kind == "item" else objective
+        unit_price = self._cached_market_price(candidate) if objective_for_record and objective_for_record.kind == "item" else None
+        progress_record = self._record_task_progress(lines, detected_role, objective_for_record, unit_price)
+        progress_note = (
+            f"；已记录 {progress_record.task} {progress_record.display_progress}" if progress_record else ""
+        )
         self.last_task_signature = signature
+        role = (self._bound_role_for_selected_window() or self.task_role_var.get().strip()) if progress_record else ""
+        self.recognized_role_var.set(role or "未识别")
+        self.target_name_var.set(candidate or "未识别")
+        self.target_quantity_var.set(objective.display_quantity if objective else "-")
+        self.npc_name_var.set(npc_name or "-")
         if window_handle is not None and region_for_cache is not None:
             self.cached_task_window = window_handle
             self.cached_task_region = region_for_cache
@@ -2529,19 +3556,24 @@ class GuolingTaskOcr(tk.Tk):
         self.recognize_button.configure(state="normal")
         if candidate:
             self.item_var.set(candidate)
-            self.market_item_var.set(candidate)
+            if not non_item_target:
+                self.market_item_var.set(candidate)
             self.last_valid_item = candidate
             self.copy_item(silent=True)
-            if self._auto_query_market_item(candidate):
-                self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板，正在自动查询行情。")
+            if non_item_target:
+                target_label = "怪物" if monster_target else "NPC"
+                self.market_status_var.set(f"当前 OCR 目标是{target_label}，已跳过自动行情查询。")
+                self.status_var.set(f"{location_note}；已识别{target_label}“{candidate}”并复制到剪贴板，未查询行情{progress_note}。")
+            elif self._auto_query_market_item(candidate):
+                self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板，正在自动查询行情{progress_note}。")
             else:
-                self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板。")
+                self.status_var.set(f"{location_note}；已识别“{candidate}”并复制到剪贴板{progress_note}。")
         else:
             if self.last_valid_item:
                 self.item_var.set(self.last_valid_item)
-                self.status_var.set(f"{location_note}；未发现完整道具行，已保留上次结果“{self.last_valid_item}”。")
+                self.status_var.set(f"{location_note}；未发现完整道具行，已保留上次结果“{self.last_valid_item}”{progress_note}。")
             else:
-                self.status_var.set(f"{location_note}；未发现完整道具行，可能被游戏界面遮挡，请关闭界面后重试。")
+                self.status_var.set(f"{location_note}；未发现完整道具行，可能被游戏界面遮挡，请关闭界面后重试{progress_note}。")
 
     def _show_error(self, text: str) -> None:
         logging.error(text)

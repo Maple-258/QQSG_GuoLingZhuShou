@@ -12,6 +12,6 @@ exit /b 0
 
 :missing_venv
 echo ERROR: Virtual environment was not found.
-echo Run scripts\安装国令助手依赖.cmd first.
+echo Run the dependency installation script first.
 pause
 exit /b 1

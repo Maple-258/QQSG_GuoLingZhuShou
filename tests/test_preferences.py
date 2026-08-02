@@ -4,15 +4,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
+from PIL import Image
+
 from guoling_task_ocr.app import (
     CAPTURE_METHODS,
+    CLOUD_TASK_OCR_MAX_PIXELS,
     DEFAULT_AUTO_INTERVAL_SECONDS,
     DEFAULT_HOTKEY,
     ensure_writable_error_stream,
+    find_hud_role_name,
+    player_info_crop_box,
     load_user_settings,
     ocr_model_directories,
     save_user_settings,
     should_skip_unchanged_task,
+    cloud_task_ocr_target_size,
+    cloud_task_crop_box,
     task_ocr_target_size,
 )
 
@@ -39,11 +46,18 @@ class PreferencesTests(unittest.TestCase):
                     "flash_wav_path": "C:\\alert.wav",
                     "flash_cooldown_seconds": 4.5,
                     "flash_enabled": True,
+                    "task_tracker_role": "小乔",
+                    "window_role_bindings": {"QQ 三国测试窗口": "小乔"},
+                    "show_changelog_on_start": False,
                     "market_account": "market-user",
                     "market_token": "market-token",
                     "market_user_id": "12345",
                     "market_region": "得陇",
                     "market_auto_query": True,
+                    "ocr_mode": "cloud",
+                    "cloud_ocr_token": "test-token",
+                    "cloud_ocr_model": "PP-OCRv6",
+                    "cloud_ocr_api_url": "https://api.example.test/predict",
                 },
                 settings_path,
             )
@@ -61,11 +75,18 @@ class PreferencesTests(unittest.TestCase):
                     "flash_wav_path": "C:\\alert.wav",
                     "flash_cooldown_seconds": 4.5,
                     "flash_enabled": True,
+                    "task_tracker_role": "小乔",
+                    "window_role_bindings": {"QQ 三国测试窗口": "小乔"},
+                    "show_changelog_on_start": False,
                     "market_account": "market-user",
                     "market_token": "market-token",
                     "market_user_id": "12345",
                     "market_region": "得陇",
                     "market_auto_query": True,
+                    "ocr_mode": "cloud",
+                    "cloud_ocr_token": "test-token",
+                    "cloud_ocr_model": "PP-OCRv6",
+                    "cloud_ocr_api_url": "https://api.example.test/predict",
                 },
             )
 
@@ -96,10 +117,39 @@ class PreferencesTests(unittest.TestCase):
         self.assertLessEqual(width * height, 4_010_000)
         self.assertLess(width, 1600 * 4)
 
+    def test_cloud_task_ocr_scale_uses_smaller_uploads(self) -> None:
+        self.assertEqual(cloud_task_ocr_target_size((400, 200)), (800, 400))
+        width, height = cloud_task_ocr_target_size((1600, 900))
+        self.assertLessEqual(width * height, CLOUD_TASK_OCR_MAX_PIXELS)
+
+    def test_cloud_task_crop_covers_the_complete_task_card(self) -> None:
+        image = Image.new("RGB", (1028, 800))
+        self.assertEqual(cloud_task_crop_box(image), (806, 308, 1020, 440))
+
     def test_only_realtime_mode_skips_an_unchanged_task(self) -> None:
         signature = b"same-task"
         self.assertFalse(should_skip_unchanged_task(False, signature, signature))
         self.assertTrue(should_skip_unchanged_task(True, signature, signature))
+
+    def test_hud_role_detection_prefers_name_beside_a_misread_level(self) -> None:
+        entries = [
+            ([[45, 30], [95, 30], [95, 50], [45, 50]], "Sv120"),
+            ([[108, 30], [190, 30], [190, 50], [108, 50]], "Maplescx"),
+            ([[50, 65], [86, 65], [86, 84], [50, 84]], "生命"),
+        ]
+        self.assertEqual(find_hud_role_name(entries), "Maplescx")
+
+    def test_hud_role_detection_rejects_uppercase_level_misread_as_a_role(self) -> None:
+        entries = [([ [45, 30], [95, 30], [95, 50], [45, 50] ], "L7120")]
+        self.assertIsNone(find_hud_role_name(entries))
+
+    def test_hud_role_detection_rejects_prefixed_level_misread_as_a_role(self) -> None:
+        entries = [([ [45, 30], [110, 30], [110, 50], [45, 50] ], "gLv120")]
+        self.assertIsNone(find_hud_role_name(entries))
+
+    def test_player_info_crop_excludes_a_window_title_bar(self) -> None:
+        image = Image.new("RGB", (1280, 760))
+        self.assertEqual(player_info_crop_box(image, (8, 31, 1272, 752)), (27, 42, 387, 161))
 
 
 if __name__ == "__main__":

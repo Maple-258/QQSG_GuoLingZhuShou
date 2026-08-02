@@ -9,6 +9,7 @@ from guoling_task_ocr.app import (
     is_newer_version,
     load_changelog,
     parse_version,
+    render_changelog,
 )
 
 
@@ -28,6 +29,14 @@ class UpdateInformationTests(unittest.TestCase):
             changelog_path = Path(temporary_directory) / "CHANGELOG.md"
             changelog_path.write_text("# 更新日志", encoding="utf-8")
             self.assertEqual(load_changelog(changelog_path), "# 更新日志")
+
+    def test_renders_markdown_changelog_without_source_markers(self) -> None:
+        rendered = render_changelog("# 更新日志\n\n## [1.3.8]\n\n- **新增** `步数追踪`")
+
+        self.assertIn("更新日志", rendered)
+        self.assertIn("1.3.8", rendered)
+        self.assertIn("• 新增 步数追踪", rendered)
+        self.assertNotIn("#", rendered)
 
     def test_reads_latest_release_metadata(self) -> None:
         payload = json.dumps({"tag_name": "v1.3.0", "html_url": "https://example.test/release"}).encode("utf-8")
