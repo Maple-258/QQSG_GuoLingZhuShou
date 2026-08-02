@@ -19,6 +19,7 @@ from guoling_task_ocr.task_progress import (
     summarize_task_rounds,
     summarize_latest_task_rounds,
     task_record_key,
+    update_task_progress_position,
 )
 
 
@@ -234,6 +235,22 @@ class TaskProgressTests(unittest.TestCase):
         self.assertEqual(second_round.round_index, 2)
         self.assertEqual(len(records), 9)
 
+    def test_tracks_third_and_fourth_rounds_when_each_starts_after_a_missed_step(self) -> None:
+        records = {}
+        objective = TaskObjective("item", "人阶强化灵宝", 0, 4)
+        for step in range(1, 9):
+            record_task_progress(records, "小乔", ParsedTaskProgress("高级国令慕贤", step, 8), objective)
+
+        for expected_round, first_seen_step in ((2, 2), (3, 3), (4, 2)):
+            first_record = record_task_progress(
+                records, "小乔", ParsedTaskProgress("高级国令慕贤", first_seen_step, 8), objective
+            )
+            self.assertEqual(first_record.round_index, expected_round)
+            for step in range(first_seen_step + 1, 9):
+                record_task_progress(records, "小乔", ParsedTaskProgress("高级国令慕贤", step, 8), objective)
+
+        self.assertEqual(sorted({record.round_index for record in records.values()}), [1, 2, 3, 4])
+
     def test_repeated_first_step_does_not_start_a_new_round(self) -> None:
         records = {}
         objective = TaskObjective("item", "灵魄成长石", 0, 1)
@@ -332,6 +349,29 @@ class TaskProgressTests(unittest.TestCase):
             records, role="小乔", task="高级国令慕贤", round_index=1, date=today
         )
         self.assertEqual(filtered, [first])
+
+    def test_manually_updates_a_record_round_and_step(self) -> None:
+        records = {}
+        record = record_task_progress(
+            records, "小乔", ParsedTaskProgress("高级国令慕贤", 3, 8), TaskObjective("item", "灵魄成长石", 0, 1)
+        )
+        updated = update_task_progress_position(records, task_record_key(record), 2, 4)
+        self.assertEqual((updated.round_index, updated.current_step), (2, 4))
+        self.assertEqual(set(records), {("小乔", "高级国令慕贤", 2, 4)})
+
+    def test_manual_position_update_requires_explicit_overwrite(self) -> None:
+        records = {}
+        first = record_task_progress(
+            records, "小乔", ParsedTaskProgress("高级国令慕贤", 1, 8), TaskObjective("item", "甲", 0, 1)
+        )
+        second = record_task_progress(
+            records, "小乔", ParsedTaskProgress("高级国令慕贤", 2, 8), TaskObjective("item", "乙", 0, 1)
+        )
+        with self.assertRaisesRegex(ValueError, "已有记录"):
+            update_task_progress_position(records, task_record_key(second), 1, 1)
+        updated = update_task_progress_position(records, task_record_key(second), 1, 1, overwrite=True)
+        self.assertEqual(updated.objective_name, "乙")
+        self.assertEqual(len(records), 1)
 
 
 if __name__ == "__main__":

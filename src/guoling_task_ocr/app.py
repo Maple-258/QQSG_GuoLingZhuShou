@@ -43,6 +43,7 @@ from .task_progress import (
     save_task_progress,
     summarize_task_rounds,
     task_record_key,
+    update_task_progress_position,
 )
 
 from PIL import Image, ImageEnhance, ImageGrab, ImageOps, ImageTk
@@ -1376,6 +1377,8 @@ class TaskProgressDialog(tk.Toplevel):
         self.task_filter_var = tk.StringVar(value="全部")
         self.round_filter_var = tk.StringVar(value="全部")
         self.date_filter_var = tk.StringVar(value="全部")
+        self.manual_round_var = tk.StringVar()
+        self.manual_step_var = tk.StringVar()
 
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
@@ -1437,6 +1440,7 @@ class TaskProgressDialog(tk.Toplevel):
         scrollbar = ttk.Scrollbar(table_holder, orient="vertical", command=self.table.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.table.configure(yscrollcommand=scrollbar.set)
+        self.table.bind("<<TreeviewSelect>>", self._select_record)
 
         footer = ttk.Frame(body)
         footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -1445,6 +1449,13 @@ class TaskProgressDialog(tk.Toplevel):
         ttk.Button(footer, text="删除所选", command=self._delete_selected).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(footer, text="清空记录", command=self._clear_records).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(footer, text="关闭", command=self.close).grid(row=0, column=3, padx=(8, 0))
+        editor = ttk.Frame(footer)
+        editor.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(editor, text="修改所选记录：轮次", style="Field.TLabel").pack(side="left")
+        ttk.Spinbox(editor, from_=1, to=9999, width=6, textvariable=self.manual_round_var).pack(side="left", padx=(6, 14))
+        ttk.Label(editor, text="步骤", style="Field.TLabel").pack(side="left")
+        ttk.Spinbox(editor, from_=1, to=9999, width=6, textvariable=self.manual_step_var).pack(side="left", padx=(6, 10))
+        ttk.Button(editor, text="应用修改", command=self._apply_manual_position).pack(side="left")
         self._refresh_table()
         self.after(100, role_entry.focus_set)
 
@@ -1457,6 +1468,56 @@ class TaskProgressDialog(tk.Toplevel):
     def _record_current_ocr(self) -> None:
         lines = self.parent_app.raw_text.get("1.0", "end").splitlines()
         self.parent_app._record_task_progress(lines)
+        self._refresh_table()
+
+    def _selected_record(self) -> tuple[tuple[str, str, int, int], TaskProgress] | None:
+        selected = self.table.selection()
+        if not selected:
+            return None
+        key = self.row_keys.get(selected[0])
+        record = self.parent_app.task_records.get(key) if key else None
+        return (key, record) if key and record else None
+
+    def _select_record(self, _event: tk.Event | None = None) -> None:
+        selected = self._selected_record()
+        if selected is None:
+            return
+        _key, record = selected
+        self.manual_round_var.set(str(record.round_index))
+        self.manual_step_var.set(str(record.current_step))
+
+    def _apply_manual_position(self) -> None:
+        selected = self._selected_record()
+        if selected is None:
+            messagebox.showinfo("提示", "请先选择要修改的任务记录。", parent=self)
+            return
+        key, record = selected
+        try:
+            round_index = int(self.manual_round_var.get())
+            current_step = int(self.manual_step_var.get())
+            updated = update_task_progress_position(
+                self.parent_app.task_records, key, round_index, current_step
+            )
+        except ValueError as error:
+            if str(error) != "目标轮次和步骤已有记录。":
+                messagebox.showerror("修改失败", str(error), parent=self)
+                return
+            if not messagebox.askyesno(
+                "覆盖记录",
+                f"第 {round_index} 轮第 {current_step} 步已有记录，是否用当前“{record.display_objective}”覆盖？",
+                parent=self,
+            ):
+                return
+            updated = update_task_progress_position(
+                self.parent_app.task_records, key, round_index, current_step, overwrite=True
+            )
+        except KeyError as error:
+            messagebox.showerror("修改失败", str(error), parent=self)
+            return
+        self.parent_app._save_task_records()
+        self.parent_app.task_progress_status_var.set(
+            f"已手动调整：{updated.role} · {updated.task} · 第 {updated.round_index} 轮 · {updated.display_progress}。"
+        )
         self._refresh_table()
 
     def _filter_changed(self, _event: tk.Event | None = None) -> None:

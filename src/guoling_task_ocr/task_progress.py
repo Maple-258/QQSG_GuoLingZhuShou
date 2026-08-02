@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -351,6 +351,28 @@ def task_record_key(record: TaskProgress) -> tuple[str, str, int, int]:
     return record.role, record.task, record.round_index, record.current_step
 
 
+def update_task_progress_position(
+    records: dict[tuple[str, str, int, int], TaskProgress],
+    key: tuple[str, str, int, int],
+    round_index: int,
+    current_step: int,
+    overwrite: bool = False,
+) -> TaskProgress:
+    """Move one saved record to a manually selected round and step."""
+    if round_index < 1 or current_step < 1:
+        raise ValueError("轮次和步骤必须大于 0。")
+    record = records.get(key)
+    if record is None:
+        raise KeyError("未找到要修改的任务记录。")
+    updated = replace(record, round_index=round_index, current_step=current_step)
+    updated_key = task_record_key(updated)
+    if updated_key != key and updated_key in records and not overwrite:
+        raise ValueError("目标轮次和步骤已有记录。")
+    records.pop(key)
+    records[updated_key] = updated
+    return updated
+
+
 def load_task_progress(progress_path: Path) -> dict[tuple[str, str, int, int], TaskProgress]:
     """Load valid saved rows, ignoring a damaged or older data file."""
     try:
@@ -477,7 +499,8 @@ def _record_round_index(
     }
     latest_step = max(latest_steps, default=0)
     completed_round = bool(round_size) and set(range(1, round_size + 1)).issubset(latest_steps)
-    if completed_round and parsed.current_step < latest_step:
+    reached_final_step = bool(round_size) and latest_step >= round_size
+    if (completed_round or reached_final_step) and parsed.current_step < latest_step:
         return latest_round + 1
     if parsed.current_step == 1:
         # A task panel never returns to step 1 within the same run.  Therefore
